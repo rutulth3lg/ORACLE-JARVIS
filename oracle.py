@@ -276,6 +276,10 @@ _tts_queue:      queue.Queue               = queue.Queue()
 _raw_audio_queue:  queue.Queue = queue.Queue()   # wake-capture → transcriber
 _wake_event_queue: queue.Queue = queue.Queue()   # transcriber  → oracle-worker
 
+# While Oracle is speaking its own TTS, suppress wake detection so it doesn't
+# hear the word "Oracle" in its own voice and trigger itself.
+_is_speaking = threading.Event()
+
 # Auto-sleep
 _last_activity_time = time.time()
 
@@ -470,6 +474,7 @@ def speak(text: str):
         return
     print(f"Oracle: {clean}")
     set_hud("speaking")
+    _is_speaking.set()
     filepath = os.path.join(
         TEMP_AUDIO_DIR,
         f"tts_{int(time.time() * 1000)}_{random.randint(100, 999)}.mp3"
@@ -481,6 +486,7 @@ def speak_blocking(text: str):
     """Enqueue text and block until it has finished playing."""
     speak(text)
     _tts_queue.join()
+    _is_speaking.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -615,9 +621,33 @@ def open_in_browser(url: str):
 
 
 def open_youtube(query: str):
-    """Open YouTube search results in the browser (correct for video requests)."""
-    url = "https://www.youtube.com/results?search_query=" + query.replace(" ", "+")
-    open_in_browser(url)
+    """
+    Get the actual first YouTube video URL via yt-dlp and open it in the browser.
+    Falls back to search results page if yt-dlp is unavailable or fails.
+    """
+    def _open():
+        try:
+            r = subprocess.run(
+                ["yt-dlp", f"ytsearch1:{query}", "--get-url", "--get-id",
+                 "--no-playlist", "--quiet", "--no-warnings",
+                 "--format", "bestvideo+bestaudio/best"],
+                capture_output=True, text=True, timeout=20
+            )
+            # yt-dlp --get-id prints the video ID on a separate line
+            id_result = subprocess.run(
+                ["yt-dlp", f"ytsearch1:{query}", "--get-id",
+                 "--no-playlist", "--quiet", "--no-warnings"],
+                capture_output=True, text=True, timeout=20
+            )
+            video_id = id_result.stdout.strip().split("\n")[0].strip()
+            if video_id:
+                open_in_browser(f"https://www.youtube.com/watch?v={video_id}")
+                return
+        except Exception as e:
+            print(f"[YouTube open] yt-dlp failed: {e}")
+        # Fallback
+        open_in_browser("https://www.youtube.com/results?search_query=" + query.replace(" ", "+"))
+    threading.Thread(target=_open, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -867,26 +897,41 @@ def handle_quick_command(raw_input: str) -> bool:
     # Workspace ritual — only fires on explicit request, never on generic wake
     if re.search(r"\b(start my workspace|workspace mode|setup workspace)\b", text):
         def _ritual():
-            # Open VS Code
             subprocess.Popen(
                 ["open", "-a", "Visual Studio Code"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
             time.sleep(0.5)
-            # Open the Claude desktop app (falls back to claude.ai if not installed)
-            claude_result = subprocess.run(
-                ["open", "-a", "Claude"],
-                capture_output=True
+            # claude.ai in browser (no desktop app required)
+            subprocess.Popen(
+                ["open", "https://claude.ai"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-            if claude_result.returncode != 0:
-                subprocess.Popen(
-                    ["open", "https://claude.ai"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                )
             time.sleep(0.3)
             speak("VS Code and Claude are open, Sir. Putting on your soundtrack.")
-            play_audio("Iron Man Black Sabbath")
+            # Open Iron Man video directly in browser via yt-dlp video ID
+            open_youtube("Iron Man Black Sabbath official")
         threading.Thread(target=_ritual, daemon=True).start()
+        return True
+
+    # Close / quit an application
+    close_m = re.search(
+        r"(?:close|quit|kill|exit|force quit)\s+(.+)", text
+    )
+    if close_m:
+        app_raw = close_m.group(1).strip().rstrip(".")
+        # Resolve friendly name to actual app name
+        app_name = NATIVE_APPS.get(app_raw, app_raw.title())
+        result = subprocess.run(
+            ["osascript", "-e", f'tell application "{app_name}" to quit'],
+            capture_output=True, timeout=5
+        )
+        if result.returncode == 0:
+            speak(f"Closed {app_raw}, Sir.")
+        else:
+            # Hard kill via pkill as fallback
+            subprocess.run(["pkill", "-x", app_name], capture_output=True)
+            speak(f"Force quit {app_raw}, Sir.")
         return True
 
     # Stop music / media
@@ -1283,6 +1328,7 @@ def get_llm_response(user_text: str):
     # Reset HUD once the TTS queue finishes draining
     def _reset_hud():
         _tts_queue.join()
+        _is_speaking.clear()
         set_hud("standby")
     threading.Thread(target=_reset_hud, daemon=True).start()
 
@@ -1354,6 +1400,9 @@ def transcription_thread():
                 pass
 
             if "oracle" in transcript or "jarvis" in transcript:
+                # Ignore if Oracle is currently speaking — it would hear its own voice
+                if _is_speaking.is_set():
+                    continue
                 # Drain stale clips before signalling — prevents double-trigger
                 while not _raw_audio_queue.empty():
                     try:
