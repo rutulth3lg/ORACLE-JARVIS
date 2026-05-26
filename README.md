@@ -1,57 +1,65 @@
 # Oracle
 
-A local voice assistant for macOS, built by Rutul Gajjar. Say "Oracle" or "Jarvis" to activate it. No cloud subscriptions, no always-on servers — it runs entirely on your Mac.
+A local voice assistant for macOS. Say **"Oracle"** or **"Jarvis"** to activate it.
+
+Built by [Rutul Gajjar](https://github.com/rutulgajjar). Open source and open to contributions — if you want to add a feature, fix a bug, or extend it in any direction, pull requests are welcome.
 
 ---
 
 ## What it does
 
-- Plays music and audio by searching YouTube (via yt-dlp, no browser needed)
+- Plays music by searching YouTube (yt-dlp, no browser tab needed)
 - Opens apps, websites, and YouTube videos on command
 - Answers questions with a rolling conversation memory that persists across sessions
-- Sets timers and reminders with voice and notification callbacks
+- Sets timers and reminders with voice and macOS notification callbacks
 - Controls system volume, takes screenshots, locks the screen
 - Remembers personal facts you tell it ("remember that my car is a Tesla")
-- Has a floating status HUD in the corner of your screen (STANDBY / LISTENING / SPEAKING)
+- Floating status HUD in the corner of your screen (STANDBY / LISTENING / SPEAKING)
 - Auto-sleeps after a configurable period of inactivity
 
 ---
 
 ## Requirements
 
-### Python packages
 ```bash
 pip install groq edge-tts SpeechRecognition pyaudio yt-dlp
-```
-
-### Homebrew packages
-```bash
 brew install portaudio ffmpeg
 ```
 
-`portaudio` is needed by PyAudio for microphone access. `ffmpeg` is used by yt-dlp when processing audio.
+Get a free Groq API key at [console.groq.com](https://console.groq.com).
 
 ---
 
 ## Setup
 
-1. Clone or download this repo.
-2. Open `oracle.py` and set your Groq API key at the top:
-   ```python
-   GROQ_API_KEY = "your_key_here"
+1. Clone the repo:
+   ```bash
+   git clone https://github.com/yourusername/oracle-assistant.git
+   cd oracle-assistant
    ```
-   Get a free key at [console.groq.com](https://console.groq.com).
-3. Run it:
+
+2. Install dependencies (see above).
+
+3. Create your `.env` file:
+   ```bash
+   cp .env.example .env
+   ```
+   Open `.env` and fill in your values:
+   ```
+   GROQ_API_KEY=your_groq_api_key_here
+   ORACLE_OWNER_NAME=Your Full Name
+   ORACLE_OWNER_FIRST=YourFirstName
+   ```
+
+4. Run it:
    ```bash
    python oracle.py
    ```
 
-### To start Oracle automatically at login
+### Auto-start at login
 ```bash
 python oracle.py --install
 ```
-This installs a LaunchAgent plist. Oracle will launch silently every time you log in with no terminal window needed.
-
 To uninstall:
 ```bash
 launchctl unload ~/Library/LaunchAgents/com.oracle.assistant.plist
@@ -60,91 +68,41 @@ rm ~/Library/LaunchAgents/com.oracle.assistant.plist
 
 ---
 
-## How to use it
+## Usage
 
-Say **"Oracle"** or **"Jarvis"** and wait for the "Sir?" acknowledgement, then speak your command.
+Say **"Oracle"** or **"Jarvis"**, wait for **"Sir?"**, then speak your command.
 
-| What you say | What happens |
+| Command | What happens |
 |---|---|
-| "Play Blinding Lights" | Finds and plays the audio via yt-dlp |
-| "Play a song by Drake" | Same — plays best match |
+| "Play Blinding Lights" | Finds and plays audio via yt-dlp |
+| "Play a song by Drake" | Same |
 | "Play Sidemen on YouTube" | Opens YouTube search in browser |
 | "Open VS Code" | Launches the app |
-| "Open GitHub" | Opens github.com in browser |
-| "Set a 10 minute timer" | Timer fires with voice + notification |
-| "Remind me to call mum in 30 minutes" | Reminder fires in 30 min |
+| "Open GitHub" | Opens github.com |
+| "Search for SpaceX news" | Google search in browser |
+| "Set a 10 minute timer" | Voice alert + macOS notification |
+| "Remind me to call mum in 30 minutes" | Same |
 | "What time is it" | Tells you the time |
-| "Battery status" | Reports battery level and charging state |
-| "Volume to 60" | Sets system volume to 60 |
+| "Battery status" | Reports level and charging state |
+| "Volume to 60" | Sets system volume |
 | "Take a screenshot" | Saves to Desktop |
 | "Lock the screen" | Locks macOS |
-| "Start my workspace" | Opens QuantConnect + VS Code + plays Iron Man |
+| "Start my workspace" | Opens VS Code + Claude, plays Iron Man |
+| "Who are you" | Oracle introduces itself |
 | "Shut down Oracle" | Exits cleanly |
-
-Oracle also auto-sleeps after 10 minutes of inactivity (configurable in `oracle.py`).
 
 ---
 
 ## Configuration
 
-All user-facing settings are at the top of `oracle.py`:
+All settings live at the top of `oracle.py`. Secrets go in `.env`.
 
 ```python
-GROQ_API_KEY       = "..."       # your Groq API key
-OWNER_NAME         = "Rutul Gajjar"
-OWNER_FIRST        = "Rutul"
-VOICE              = "en-GB-RyanNeural"   # edge-tts voice
-AUTO_SLEEP_MINUTES = 10                   # 0 to disable auto-sleep
+VOICE              = "en-GB-RyanNeural"   # any edge-tts voice
+AUTO_SLEEP_MINUTES = 10                   # 0 to disable
 TTS_RATE           = "+6%"               # voice speed
 MAX_HISTORY_TURNS  = 20                   # conversation memory depth
 ```
-
----
-
-## Uploading to GitHub
-
-1. **Create a new repository** at [github.com/new](https://github.com/new). Name it something like `oracle-assistant`. Keep it private if you want.
-
-2. **Initialise git in this folder:**
-   ```bash
-   cd /path/to/oracle/folder
-   git init
-   git add oracle.py README.md
-   git commit -m "Initial commit"
-   ```
-
-3. **Add your remote and push:**
-   ```bash
-   git remote add origin https://github.com/YOUR_USERNAME/oracle-assistant.git
-   git branch -M main
-   git push -u origin main
-   ```
-
-4. **Before pushing, remove your API key from the code.** Replace it with an environment variable so it's never in the repo:
-
-   In `oracle.py`, change:
-   ```python
-   GROQ_API_KEY = "gsk_..."
-   ```
-   to:
-   ```python
-   GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-   ```
-   Then set it in your shell:
-   ```bash
-   export GROQ_API_KEY="gsk_..."
-   ```
-   Add that line to your `~/.zshrc` or `~/.bash_profile` so it persists.
-
-5. **Add a `.gitignore`** to avoid committing memory files and temp audio:
-   ```
-   oracle_memory.json
-   oracle_tmp/
-   *.mp3
-   *.wav
-   __pycache__/
-   *.pyc
-   ```
 
 ---
 
@@ -152,26 +110,50 @@ MAX_HISTORY_TURNS  = 20                   # conversation memory depth
 
 | Thread | Role |
 |---|---|
-| Main thread | tkinter HUD — never blocked |
-| `oracle-worker` | All mic I/O, Whisper transcription of commands, LLM calls |
-| `wake-capture` | Keeps microphone open continuously, pushes audio clips to queue |
-| `transcriber` | Runs Whisper on wake clips, signals oracle-worker on detection |
-| `tts-worker` | Asyncio event loop — generates edge-tts audio and plays it |
+| Main thread | tkinter HUD only — never blocked |
+| `oracle-worker` | Mic I/O, Whisper, LLM calls — serialised |
+| `wake-capture` | Keeps microphone open, pushes clips to queue |
+| `transcriber` | Whisper on wake clips, signals worker on detection |
+| `tts-worker` | Asyncio loop — edge-tts generation + afplay |
 | `media-player` | yt-dlp download + afplay per play request |
-| Timer/reminder threads | One per active timer, fire independently |
+| Timer threads | One per active timer/reminder |
+
+---
+
+## Contributing
+
+Contributions are welcome. A few ideas if you want to pick something up:
+
+- Spotify playback control via AppleScript
+- Calendar integration (read upcoming events)
+- Weather lookups
+- Custom wake words
+- Windows / Linux support
+
+To contribute:
+
+1. Fork the repo
+2. Create a branch: `git checkout -b feature/your-feature-name`
+3. Make your changes
+4. Open a pull request with a clear description of what you added
+
+Please keep the code style consistent — plain comments, no AI-banner decorations, functions that do one thing.
+
+---
+
+## License
+
+MIT — do whatever you want with it, just keep the credit.
 
 ---
 
 ## Troubleshooting
 
-**Music searches but nothing plays**
-Run `yt-dlp --version` and `ffmpeg -version` in terminal. If either is missing, install them with pip/brew as shown above.
+**Music finds the track but doesn't play**
+Run `yt-dlp --version` and `ffmpeg -version`. If either is missing, install them. yt-dlp downloads to a temp file before playing — first start takes 5–15 seconds.
 
-**Microphone not picking up wake word**
-Increase `energy_threshold` in `wake_capture_thread()`. The default is 600 — try 400 if your environment is quiet.
+**Wake word not triggering**
+Raise `energy_threshold` in `wake_capture_thread()` if there are false triggers, or lower it if it's not picking up your voice.
 
-**"Sir?" fires but Oracle doesn't respond to the command**
-The command listener has a 7-second timeout. Speak within 7 seconds of hearing "Sir?".
-
-**TTS generates but no audio plays**
-Check that macOS has granted microphone and audio output permissions to Terminal (System Preferences → Privacy & Security → Microphone).# ORACLE-JARVIS
+**TTS generates but no audio**
+Check Terminal has microphone and audio permissions: System Settings → Privacy & Security → Microphone.

@@ -850,24 +850,41 @@ def handle_quick_command(raw_input: str) -> bool:
 
     # Introduction / who are you
     if re.search(r"\b(who are you|introduce yourself|what are you|your name)\b", text):
+        # Split across multiple speak() calls so every sentence is queued
+        # individually — the TTS pipeline is guaranteed to play all of them.
+        speak(f"I'm Oracle, {OWNER_FIRST}'s personal AI assistant.")
         speak(
-            f"I'm Oracle, {OWNER_FIRST}'s personal AI assistant. "
-            f"I'm built to run entirely on this Mac — handling anything from opening apps "
-            f"and playing music, to answering questions, setting reminders, and keeping "
-            f"track of whatever {OWNER_FIRST} needs me to remember. "
-            f"Think of me as a quieter, more obedient version of JARVIS, Sir."
+            "I run entirely on this Mac and handle everything from opening apps "
+            "and playing music, to answering questions and setting reminders."
         )
+        speak(
+            f"I remember our conversations across sessions, and I keep track of "
+            f"whatever {OWNER_FIRST} needs me to know."
+        )
+        speak("Think of me as a quieter, more capable version of JARVIS, Sir.")
         return True
 
-    # Workspace ritual — only on explicit request
+    # Workspace ritual — only fires on explicit request, never on generic wake
     if re.search(r"\b(start my workspace|workspace mode|setup workspace)\b", text):
         def _ritual():
-            subprocess.Popen(["open", "-a", "Google Chrome",
-                               "https://www.quantconnect.com"])
-            time.sleep(0.7)
-            subprocess.Popen(["open", "-a", "Visual Studio Code"])
+            # Open VS Code
+            subprocess.Popen(
+                ["open", "-a", "Visual Studio Code"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            time.sleep(0.5)
+            # Open the Claude desktop app (falls back to claude.ai if not installed)
+            claude_result = subprocess.run(
+                ["open", "-a", "Claude"],
+                capture_output=True
+            )
+            if claude_result.returncode != 0:
+                subprocess.Popen(
+                    ["open", "https://claude.ai"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
             time.sleep(0.3)
-            speak("QuantConnect and VS Code are open. Putting on your soundtrack.")
+            speak("VS Code and Claude are open, Sir. Putting on your soundtrack.")
             play_audio("Iron Man Black Sabbath")
         threading.Thread(target=_ritual, daemon=True).start()
         return True
