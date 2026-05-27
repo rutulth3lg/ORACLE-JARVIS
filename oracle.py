@@ -907,8 +907,8 @@ def handle_quick_command(raw_input: str) -> bool:
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
             speak("VS Code and Claude are open, Sir. Putting on your soundtrack.")
-            # Open Iron Man video directly in browser via yt-dlp video ID
-            open_youtube("Paranoid Black Sabbath official")
+            # Open Paranoid by black sabbath video directly in browser via yt-dlp video ID
+            open_youtube("Black Sabbath official")
         threading.Thread(target=_ritual, daemon=True).start()
         return True
 
