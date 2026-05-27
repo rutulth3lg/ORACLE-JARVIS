@@ -901,16 +901,14 @@ def handle_quick_command(raw_input: str) -> bool:
                 ["open", "-a", "Visual Studio Code"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-            time.sleep(0.5)
             # claude.ai in browser (no desktop app required)
             subprocess.Popen(
                 ["open", "https://claude.ai"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-            time.sleep(0.3)
             speak("VS Code and Claude are open, Sir. Putting on your soundtrack.")
             # Open Iron Man video directly in browser via yt-dlp video ID
-            open_youtube("Iron Man Black Sabbath official")
+            open_youtube("Paranoid Black Sabbath official")
         threading.Thread(target=_ritual, daemon=True).start()
         return True
 
