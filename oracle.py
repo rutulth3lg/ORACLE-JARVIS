@@ -162,7 +162,8 @@ class OracleHUD:
         label_text, win_bg, frame_bg, fg = cfg
 
         self.root.configure(bg=win_bg)
-        self.frame.configure(bg=frame_bg, highlightbackground=fg + "44")
+        # tkinter on macOS only supports 6-digit #RRGGBB — no alpha suffix
+        self.frame.configure(bg=frame_bg, highlightbackground=frame_bg)
         self.label.configure(text=label_text, fg=fg, bg=frame_bg)
 
         if self._pulse_job:
@@ -203,7 +204,15 @@ def load_memory():
         print(f"[Memory] Loaded {len(_conversation_history)//2} turns, "
               f"{len(_named_facts)} stored facts.")
     except Exception as e:
-        print(f"[Memory] Could not load: {e}")
+        print(f"[Memory] Corrupt memory file — resetting. ({e})")
+        # Back up the bad file then start fresh
+        import shutil
+        try:
+            shutil.move(MEMORY_FILE, MEMORY_FILE + ".bak")
+        except Exception:
+            pass
+        _conversation_history = []
+        _named_facts = {}
 
 
 def save_memory():
@@ -916,7 +925,7 @@ def handle_quick_command(raw_input: str) -> bool:
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
             time.sleep(0.4)
-            print("[Workspace] Opening Paranoid on YouTube")
+            print("[Workspace] Opening paranoid on YouTube")
             open_youtube("Paranoid Black Sabbath official audio")
         threading.Thread(target=_ritual, name="workspace-ritual", daemon=True).start()
         return True
@@ -1380,11 +1389,17 @@ def transcription_thread():
     """
     Pulls WAV bytes from _raw_audio_queue, sends each to Whisper, and posts
     to _wake_event_queue whenever "oracle" or "jarvis" is detected.
+    On connection errors, backs off and retries silently.
     """
-    thread_id = threading.get_ident()
-    temp_wav  = os.path.join(TEMP_AUDIO_DIR, f"wake_{thread_id}.wav")
+    thread_id    = threading.get_ident()
+    temp_wav     = os.path.join(TEMP_AUDIO_DIR, f"wake_{thread_id}.wav")
+    backoff      = 0.0   # seconds to wait after a connection failure
+    error_count  = 0
 
     while True:
+        if backoff > 0:
+            time.sleep(backoff)
+
         try:
             wav_bytes = _raw_audio_queue.get(timeout=0.5)
         except queue.Empty:
@@ -1406,11 +1421,13 @@ def transcription_thread():
             except OSError:
                 pass
 
+            # Successful call — reset backoff
+            backoff     = 0.0
+            error_count = 0
+
             if "oracle" in transcript or "jarvis" in transcript:
-                # Ignore if Oracle is currently speaking — it would hear its own voice
                 if _is_speaking.is_set():
                     continue
-                # Drain stale clips before signalling — prevents double-trigger
                 while not _raw_audio_queue.empty():
                     try:
                         _raw_audio_queue.get_nowait()
@@ -1419,7 +1436,27 @@ def transcription_thread():
                 _wake_event_queue.put(True)
 
         except Exception as e:
-            print(f"[Transcription] {e}")
+            error_count += 1
+            err_str = str(e).lower()
+
+            if "connection" in err_str or "network" in err_str or "timeout" in err_str:
+                # Network issue — back off exponentially, max 30s, print once per burst
+                backoff = min(30.0, 2 ** min(error_count, 5))
+                if error_count == 1:
+                    print(f"[Transcription] Network error — retrying every {backoff:.0f}s. "
+                          f"Check your internet connection and API key.")
+            elif "401" in err_str or "auth" in err_str or "invalid" in err_str:
+                print("[Transcription] API key invalid. Check GROQ_API_KEY in your .env file.")
+                backoff = 60.0   # no point hammering with a bad key
+            elif "429" in err_str or "rate" in err_str:
+                backoff = 10.0
+                if error_count == 1:
+                    print("[Transcription] Rate limited — backing off 10s.")
+            else:
+                # Unknown error — log it once, small backoff
+                if error_count <= 3:
+                    print(f"[Transcription] {e}")
+                backoff = 2.0
 
 
 # ---------------------------------------------------------------------------

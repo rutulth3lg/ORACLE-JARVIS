@@ -87,7 +87,7 @@ Say **"Oracle"** or **"Jarvis"**, wait for **"Sir?"**, then speak your command.
 | "Volume to 60" | Sets system volume |
 | "Take a screenshot" | Saves to Desktop |
 | "Lock the screen" | Locks macOS |
-| "Start my workspace" | Opens VS Code + Claude, plays Iron Man |
+| "Start my workspace" | Opens VS Code + Claude, plays Paranoid |
 | "Who are you" | Oracle introduces itself |
 | "Shut down Oracle" | Exits cleanly |
 
