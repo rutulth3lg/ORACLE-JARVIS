@@ -622,32 +622,37 @@ def open_in_browser(url: str):
 
 def open_youtube(query: str):
     """
-    Get the actual first YouTube video URL via yt-dlp and open it in the browser.
-    Falls back to search results page if yt-dlp is unavailable or fails.
+    Open the first matching YouTube video directly in the browser.
+    Uses yt-dlp to resolve the video ID, then opens youtube.com/watch?v=ID.
+    Falls back to search results if yt-dlp fails or times out.
     """
     def _open():
         try:
-            r = subprocess.run(
-                ["yt-dlp", f"ytsearch1:{query}", "--get-url", "--get-id",
-                 "--no-playlist", "--quiet", "--no-warnings",
-                 "--format", "bestvideo+bestaudio/best"],
-                capture_output=True, text=True, timeout=20
+            result = subprocess.run(
+                [
+                    "yt-dlp",
+                    f"ytsearch1:{query}",
+                    "--print", "id",          # prints ONLY the video ID, one line
+                    "--no-playlist",
+                    "--quiet",
+                    "--no-warnings",
+                    "--skip-download",
+                ],
+                capture_output=True, text=True, timeout=25,
             )
-            # yt-dlp --get-id prints the video ID on a separate line
-            id_result = subprocess.run(
-                ["yt-dlp", f"ytsearch1:{query}", "--get-id",
-                 "--no-playlist", "--quiet", "--no-warnings"],
-                capture_output=True, text=True, timeout=20
-            )
-            video_id = id_result.stdout.strip().split("\n")[0].strip()
-            if video_id:
+            video_id = result.stdout.strip().splitlines()[0].strip()
+            # A valid YouTube video ID is exactly 11 characters
+            if video_id and len(video_id) == 11:
                 open_in_browser(f"https://www.youtube.com/watch?v={video_id}")
+                print(f"[YouTube] opened watch?v={video_id}")
                 return
         except Exception as e:
-            print(f"[YouTube open] yt-dlp failed: {e}")
-        # Fallback
-        open_in_browser("https://www.youtube.com/results?search_query=" + query.replace(" ", "+"))
-    threading.Thread(target=_open, daemon=True).start()
+            print(f"[YouTube open] {e}")
+        # Fallback: open search results page
+        fallback = "https://www.youtube.com/results?search_query=" + query.replace(" ", "+")
+        open_in_browser(fallback)
+        print(f"[YouTube] fell back to search results for: {query}")
+    threading.Thread(target=_open, name="yt-open", daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -894,53 +899,27 @@ def handle_quick_command(raw_input: str) -> bool:
         speak("Think of me as a quieter, more capable version of JARVIS, Sir.")
         return True
 
-    # ...existing code...
     # Workspace ritual — only fires on explicit request, never on generic wake
     if re.search(r"\b(start my workspace|workspace mode|setup workspace)\b", text):
+        # Speak confirmation immediately on the worker thread before launching anything
+        speak("On it, Sir.")
         def _ritual():
+            print("[Workspace] Opening VS Code")
             subprocess.Popen(
                 ["open", "-a", "Visual Studio Code"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-            time.sleep(0.5)
-            # claude.ai in browser (no desktop app required)
+            time.sleep(0.6)
+            print("[Workspace] Opening claude.ai")
             subprocess.Popen(
                 ["open", "https://claude.ai"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-            time.sleep(0.3)
-            speak("VS Code and Claude are open, Sir. Putting on your soundtrack.")
-            # Open Iron Man video directly in browser via yt-dlp video ID
-            open_youtube("Iron Man Black Sabbath official")
-        threading.Thread(target=_ritual, daemon=True).start()
+            time.sleep(0.4)
+            print("[Workspace] Opening Paranoid on YouTube")
+            open_youtube("Paranoid Black Sabbath official audio")
+        threading.Thread(target=_ritual, name="workspace-ritual", daemon=True).start()
         return True
-
-    # Handle casual combined requests like:
-    # "play paranoid by black sabbath and open up VS Code and Claude"
-    if (
-        "vs code" in text or "visual studio code" in text or "vscode" in text
-        or "claude" in text
-        or re.search(r"\bparanoid\b", text)
-        or "black sabbath" in text
-    ):
-        # Open VS Code if requested
-        if "vs code" in text or "visual studio code" in text or "vscode" in text:
-            subprocess.Popen(
-                ["open", "-a", "Visual Studio Code"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-        # Open Claude in browser if requested
-        if "claude" in text:
-            subprocess.Popen(
-                ["open", "https://claude.ai"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-        # Play Paranoid if requested (or any mention of Black Sabbath / Paranoid)
-        if re.search(r"\bparanoid\b", text) or "black sabbath" in text:
-            speak("On it, Sir. Playing Paranoid by Black Sabbath now.")
-            play_audio("Paranoid Black Sabbath")
-        return True
-# ...existing code...
 
     # Close / quit an application
     close_m = re.search(
