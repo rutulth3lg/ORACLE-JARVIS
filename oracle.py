@@ -894,6 +894,7 @@ def handle_quick_command(raw_input: str) -> bool:
         speak("Think of me as a quieter, more capable version of JARVIS, Sir.")
         return True
 
+    # ...existing code...
     # Workspace ritual — only fires on explicit request, never on generic wake
     if re.search(r"\b(start my workspace|workspace mode|setup workspace)\b", text):
         def _ritual():
@@ -901,16 +902,45 @@ def handle_quick_command(raw_input: str) -> bool:
                 ["open", "-a", "Visual Studio Code"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
+            time.sleep(0.5)
             # claude.ai in browser (no desktop app required)
             subprocess.Popen(
                 ["open", "https://claude.ai"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
+            time.sleep(0.3)
             speak("VS Code and Claude are open, Sir. Putting on your soundtrack.")
-            # Open Paranoid by black sabbath video directly in browser via yt-dlp video ID
-            open_youtube("Black Sabbath official")
+            # Open Iron Man video directly in browser via yt-dlp video ID
+            open_youtube("Iron Man Black Sabbath official")
         threading.Thread(target=_ritual, daemon=True).start()
         return True
+
+    # Handle casual combined requests like:
+    # "play paranoid by black sabbath and open up VS Code and Claude"
+    if (
+        "vs code" in text or "visual studio code" in text or "vscode" in text
+        or "claude" in text
+        or re.search(r"\bparanoid\b", text)
+        or "black sabbath" in text
+    ):
+        # Open VS Code if requested
+        if "vs code" in text or "visual studio code" in text or "vscode" in text:
+            subprocess.Popen(
+                ["open", "-a", "Visual Studio Code"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        # Open Claude in browser if requested
+        if "claude" in text:
+            subprocess.Popen(
+                ["open", "https://claude.ai"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        # Play Paranoid if requested (or any mention of Black Sabbath / Paranoid)
+        if re.search(r"\bparanoid\b", text) or "black sabbath" in text:
+            speak("On it, Sir. Playing Paranoid by Black Sabbath now.")
+            play_audio("Paranoid Black Sabbath")
+        return True
+# ...existing code...
 
     # Close / quit an application
     close_m = re.search(
