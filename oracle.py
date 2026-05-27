@@ -894,8 +894,6 @@ def handle_quick_command(raw_input: str) -> bool:
 
     # Introduction / who are you
     if re.search(r"\b(who are you|introduce yourself|what are you|your name)\b", text):
-        # Split across multiple speak() calls so every sentence is queued
-        # individually — the TTS pipeline is guaranteed to play all of them.
         speak(f"I'm Oracle, {OWNER_FIRST}'s personal AI assistant.")
         speak(
             "I run entirely on this Mac and handle everything from opening apps "
@@ -905,13 +903,13 @@ def handle_quick_command(raw_input: str) -> bool:
             f"I remember our conversations across sessions, and I keep track of "
             f"whatever {OWNER_FIRST} needs me to know."
         )
-        speak("Think of me as a quieter, more capable version of JARVIS, Sir.")
+        speak_blocking("Think of me as a quieter, more capable version of JARVIS, Sir.")
         return True
 
     # Workspace ritual — only fires on explicit request, never on generic wake
     if re.search(r"\b(start my workspace|workspace mode|setup workspace)\b", text):
         # Speak confirmation immediately on the worker thread before launching anything
-        speak("On it, Sir.")
+        speak_blocking("On it, Sir.")
         def _ritual():
             print("[Workspace] Opening VS Code")
             subprocess.Popen(
@@ -925,7 +923,7 @@ def handle_quick_command(raw_input: str) -> bool:
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
             time.sleep(0.4)
-            print("[Workspace] Opening paranoid on YouTube")
+            print("[Workspace] Opening Paranoid on YouTube")
             open_youtube("Paranoid Black Sabbath official audio")
         threading.Thread(target=_ritual, name="workspace-ritual", daemon=True).start()
         return True
@@ -987,7 +985,12 @@ def handle_quick_command(raw_input: str) -> bool:
         text
     )
     if yt_video_m:
-        query = (yt_video_m.group(1) or yt_video_m.group(2) or "trending").strip()
+        query = (yt_video_m.group(1) or yt_video_m.group(2) or "").strip()
+        # Replace vague queries with something actually useful
+        vague = {"any", "anything", "something", "a video", "any video",
+                 "something good", "your choice", "whatever"}
+        if not query or query.lower() in vague:
+            query = "trending music 2025"
         open_youtube(query)
         speak(f"Opening {query} on YouTube, Sir.")
         return True
@@ -1569,6 +1572,10 @@ def oracle_worker():
             stop_tts_flag.clear()
             get_llm_response(user_input)
 
+        # Always clear _is_speaking when the command cycle ends so the
+        # transcription thread can detect the next wake word
+        _tts_queue.join()
+        _is_speaking.clear()
         set_hud("standby")
 
 
