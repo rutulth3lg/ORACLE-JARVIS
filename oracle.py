@@ -21,6 +21,8 @@ import sys
 import time
 import re
 import json
+import uuid
+import shutil
 import subprocess
 import threading
 import random
@@ -29,6 +31,8 @@ import asyncio
 import datetime
 import tkinter as tk
 from tkinter import font as tkfont
+from dataclasses import dataclass
+from typing import Callable
 
 import speech_recognition as sr
 from groq import Groq
@@ -39,14 +43,23 @@ import edge_tts
 #   GROQ_API_KEY=your_key_here
 #   ORACLE_OWNER_NAME=Your Full Name
 #   ORACLE_OWNER_FIRST=YourFirstName
-_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-if os.path.exists(_env_path):
-    with open(_env_path) as _ef:
-        for _line in _ef:
-            _line = _line.strip()
-            if _line and not _line.startswith("#") and "=" in _line:
-                _k, _v = _line.split("=", 1)
-                os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+def _load_env(path: str) -> None:
+    """Parse a .env file and inject missing keys into os.environ."""
+    if not os.path.exists(path):
+        return
+    with open(path) as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            os.environ.setdefault(
+                key.strip(),
+                val.strip().strip('"').strip("'"),
+            )
+
+
+_load_env(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 
 # ---------------------------------------------------------------------------
@@ -66,9 +79,29 @@ TTS_RATE           = "+6%"      # edge-tts speed — tweak if voice feels off
 TTS_AFPLAY_SPEED   = "1.0"      # afplay -r multiplier
 MAX_HISTORY_TURNS  = 20         # how many back-and-forth turns to keep in LLM context
 
-# Auto-sleep: Oracle shuts down after this many minutes of silence.
-# Set to 0 to disable.
+# Auto-sleep: Oracle goes standby after this many minutes of silence (0 = never).
 AUTO_SLEEP_MINUTES = 10
+
+# Maximum total characters from memory facts that are injected into each LLM
+# context. Prevents a bloated facts block from silently eating context space.
+MAX_FACTS_CHARS = 1_200
+
+# Maximum combined characters across history + facts before we start trimming
+# history to avoid hitting Groq's context limit.
+MAX_CONTEXT_CHARS = 28_000
+
+# ---------------------------------------------------------------------------
+# Workspace ritual — change these without touching any other code
+# ---------------------------------------------------------------------------
+
+WORKSPACE_CONFIG: dict[str, str] = {
+    # macOS apps to open (order matters — they open sequentially)
+    "apps":  ["Visual Studio Code"],
+    # URLs to open in the browser
+    "urls":  ["https://claude.ai"],
+    # YouTube search to kick off (leave empty to skip)
+    "music": "Paranoid Black Sabbath official audio",
+}
 
 # Groq client (single shared instance)
 groq_client = Groq(api_key=GROQ_API_KEY)
@@ -176,10 +209,21 @@ class OracleHUD:
     def _start_pulse(self, fg: str):
         if self._state not in ("listening", "processing", "waking"):
             return
-        current = self.label.cget("fg")
-        dimmed  = fg + "55"
-        self.label.configure(fg=(fg if current != fg else dimmed))
+        # Toggle between full brightness and dimmed using a boolean flag —
+        # more reliable than comparing tkinter color strings which may be
+        # normalised differently depending on the platform.
+        self._pulse_bright = not getattr(self, "_pulse_bright", True)
+        self.label.configure(fg=(fg if self._pulse_bright else self._dim_color(fg)))
         self._pulse_job = self.root.after(380, lambda: self._start_pulse(fg))
+
+    @staticmethod
+    def _dim_color(hex_color: str) -> str:
+        """Return a 50 %-brightness version of a #RRGGBB color string."""
+        h = hex_color.lstrip("#")
+        if len(h) != 6:
+            return hex_color
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return "#{:02x}{:02x}{:02x}".format(r // 2, g // 2, b // 2)
 
 
 # ---------------------------------------------------------------------------
@@ -205,8 +249,6 @@ def load_memory():
               f"{len(_named_facts)} stored facts.")
     except Exception as e:
         print(f"[Memory] Corrupt memory file — resetting. ({e})")
-        # Back up the bad file then start fresh
-        import shutil
         try:
             shutil.move(MEMORY_FILE, MEMORY_FILE + ".bak")
         except Exception:
@@ -216,7 +258,12 @@ def load_memory():
 
 
 def save_memory():
-    """Write memory to disk on a background thread so we never block the worker."""
+    """Atomically write memory to disk on a background thread.
+
+    Writes to a .tmp file first then replaces the target — guarantees
+    the on-disk file is never left in a half-written state if the
+    process is killed mid-write.
+    """
     def _write():
         with _memory_lock:
             payload = {
@@ -224,19 +271,29 @@ def save_memory():
                 "facts":     dict(_named_facts),
                 "saved_at":  datetime.datetime.now().isoformat(),
             }
+        tmp = MEMORY_FILE + ".tmp"
         try:
-            with open(MEMORY_FILE, "w") as f:
+            with open(tmp, "w") as f:
                 json.dump(payload, f, indent=2)
+            os.replace(tmp, MEMORY_FILE)
         except Exception as e:
             print(f"[Memory] Could not save: {e}")
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
     threading.Thread(target=_write, daemon=True).start()
 
 
 def add_to_history(role: str, content: str):
     with _memory_lock:
         _conversation_history.append({"role": role, "content": content})
-        if len(_conversation_history) > MAX_HISTORY_TURNS * 2:
-            _conversation_history[:] = _conversation_history[-MAX_HISTORY_TURNS * 2:]
+        # Trim from the front, keeping an even number so role pairs stay intact
+        max_items = MAX_HISTORY_TURNS * 2
+        if len(_conversation_history) > max_items:
+            excess = len(_conversation_history) - max_items
+            # Always remove an even count to preserve user/assistant pairing
+            del _conversation_history[:excess + (excess % 2)]
     save_memory()
 
 
@@ -247,19 +304,57 @@ def store_fact(key: str, value: str):
 
 
 def facts_context_block() -> str:
+    """Return a formatted string of stored facts, capped at MAX_FACTS_CHARS.
+
+    If the full facts block would exceed the cap, facts are included
+    from the most recently stored (highest dict insertion order) until
+    the budget is exhausted.
+    """
     with _memory_lock:
         if not _named_facts:
             return ""
-        lines = "\n".join(f"  {k}: {v}" for k, v in _named_facts.items())
-        return f"\n\nThings Oracle knows about {OWNER_FIRST}:\n{lines}"
+        lines   = [f"  {k}: {v}" for k, v in _named_facts.items()]
+        header  = f"\n\nThings Oracle knows about {OWNER_FIRST}:\n"
+        budget  = MAX_FACTS_CHARS - len(header)
+        kept: list[str] = []
+        for line in reversed(lines):
+            if budget - len(line) - 1 < 0:
+                break
+            kept.insert(0, line)
+            budget -= len(line) + 1  # +1 for the newline
+        if not kept:
+            return ""
+        return header + "\n".join(kept)
 
 
 def build_llm_messages(user_text: str) -> list[dict]:
+    """Assemble the full message list for the LLM, trimming history if needed
+    to stay within MAX_CONTEXT_CHARS and avoid silent context-window overflow.
+    """
     with _memory_lock:
         history_copy = list(_conversation_history)
-    system = SYSTEM_PROMPT + facts_context_block()
-    return [{"role": "system", "content": system}, *history_copy,
-            {"role": "user",   "content": user_text}]
+
+    facts_block = facts_context_block()
+    system_text = SYSTEM_PROMPT + facts_block
+
+    # Trim history from the front (oldest first) until the total character
+    # count across system + history + new user message fits the budget.
+    # Always trim in pairs to preserve role ordering.
+    user_chars = len(user_text)
+    sys_chars  = len(system_text)
+
+    while history_copy:
+        history_chars = sum(len(m["content"]) for m in history_copy)
+        if sys_chars + history_chars + user_chars <= MAX_CONTEXT_CHARS:
+            break
+        # Drop the oldest user+assistant pair
+        history_copy = history_copy[2:]
+
+    return [
+        {"role": "system", "content": system_text},
+        *history_copy,
+        {"role": "user",   "content": user_text},
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +387,9 @@ _is_speaking = threading.Event()
 # Auto-sleep
 _last_activity_time = time.time()
 
+# Wi-Fi SSID cache: [ssid_or_None, monotonic_timestamp]
+_wifi_cache: list = [None, 0.0]
+
 
 # ---------------------------------------------------------------------------
 # Text sanitisation — strip tags and markdown before speaking
@@ -299,17 +397,60 @@ _last_activity_time = time.time()
 
 _ACTION_TAG_RE = re.compile(r'\[ACTION:[^\]]*\]', re.IGNORECASE)
 
+# Compiled substitution table for sanitize_for_speech.
+# Each entry is (compiled_pattern, replacement_string).
+# Ordered so that more specific patterns run before general ones.
+_SPEECH_SUBS: list[tuple[re.Pattern, str]] = [
+    # Markdown / formatting noise
+    (re.compile(r'\*{1,3}'),                          ""),
+    (re.compile(r'`{1,3}'),                           ""),
+    (re.compile(r'#{1,6}\s?'),                        ""),
+    # Dashes used as punctuation
+    (re.compile(r'\s*—\s*'),                          ", "),
+    (re.compile(r'\s*–\s*'),                          ", "),
+    # URLs — strip completely
+    (re.compile(r'https?://\S+'),                     ""),
+    # Numbers with suffixes  (e.g. "100k", "2.5M", "1B")
+    (re.compile(r'(\d+\.?\d*)k\b',  re.IGNORECASE),  r'\1 thousand'),
+    (re.compile(r'(\d+\.?\d*)M\b'),                   r'\1 million'),
+    (re.compile(r'(\d+\.?\d*)B\b'),                   r'\1 billion'),
+    (re.compile(r'(\d+\.?\d*)T\b'),                   r'\1 trillion'),
+    # Version strings  "v2.3" → "version 2.3"
+    (re.compile(r'\bv(\d+\.\d+)',   re.IGNORECASE),   r'version \1'),
+    # Common symbols
+    (re.compile(r'&'),                                 " and "),
+    (re.compile(r'%'),                                 " percent"),
+    (re.compile(r'\$(\d)'),                            r'\1 dollars'),
+    (re.compile(r'#(\d)'),                             r'number \1'),
+    (re.compile(r'#(\w)'),                             r'hash \1'),
+    (re.compile(r'\+'),                                " plus "),
+    # Common abbreviations
+    (re.compile(r'\be\.g\.\b',      re.IGNORECASE),   "for example"),
+    (re.compile(r'\bi\.e\.\b',      re.IGNORECASE),   "that is"),
+    (re.compile(r'\bvs\.?\b',       re.IGNORECASE),   "versus"),
+    (re.compile(r'\betc\.?\b',      re.IGNORECASE),   "et cetera"),
+    (re.compile(r'\bapprox\.?\b',   re.IGNORECASE),   "approximately"),
+    (re.compile(r'\bmin\.?\b',      re.IGNORECASE),   "minutes"),
+    (re.compile(r'\bmax\.?\b',      re.IGNORECASE),   "maximum"),
+    (re.compile(r'\bAI\b'),                            "A I"),
+    (re.compile(r'\bUI\b'),                            "U I"),
+    (re.compile(r'\bAPI\b'),                           "A P I"),
+    (re.compile(r'\bURL\b'),                           "U R L"),
+    (re.compile(r'\bCPU\b'),                           "C P U"),
+    (re.compile(r'\bGPU\b'),                           "G P U"),
+    (re.compile(r'\bRAM\b'),                           "RAM"),   # already pronounceable
+    (re.compile(r'\bSSD\b'),                           "S S D"),
+    # Whitespace cleanup — always last
+    (re.compile(r'\s{2,}'),                            " "),
+]
+
 
 def sanitize_for_speech(text: str) -> str:
+    """Strip formatting, expand abbreviations/symbols, and clean whitespace
+    so the text reads naturally when passed to the TTS engine."""
     text = _ACTION_TAG_RE.sub("", text)
-    for old, new in [("**",""),("*",""),('`',""),("#",""),("—",", "),("–",", ")]:
-        text = text.replace(old, new)
-    text = re.sub(r'\be\.g\.\b', "for example", text, flags=re.IGNORECASE)
-    text = re.sub(r'\bi\.e\.\b', "that is",     text, flags=re.IGNORECASE)
-    text = re.sub(r'\bvs\.?\b',  "versus",      text, flags=re.IGNORECASE)
-    text = re.sub(r'\betc\.?\b', "et cetera",   text, flags=re.IGNORECASE)
-    text = re.sub(r'https?://\S+', "", text)
-    text = re.sub(r'\s{2,}', " ", text)
+    for pattern, replacement in _SPEECH_SUBS:
+        text = pattern.sub(replacement, text)
     return text.strip()
 
 
@@ -484,10 +625,7 @@ def speak(text: str):
     print(f"Oracle: {clean}")
     set_hud("speaking")
     _is_speaking.set()
-    filepath = os.path.join(
-        TEMP_AUDIO_DIR,
-        f"tts_{int(time.time() * 1000)}_{random.randint(100, 999)}.mp3"
-    )
+    filepath = os.path.join(TEMP_AUDIO_DIR, f"tts_{uuid.uuid4().hex}.mp3")
     _tts_queue.put((clean, filepath))
 
 
@@ -699,6 +837,24 @@ def set_volume(level: int):
 
 
 def get_wifi_name() -> str:
+    """Return the current Wi-Fi SSID.
+
+    Caches the result for 30 seconds so repeated calls don't repeatedly
+    invoke the slow system_profiler process.
+    """
+    now = time.monotonic()
+    cached_val, cached_at = _wifi_cache
+    if cached_val is not None and (now - cached_at) < 30:
+        return cached_val
+
+    ssid = _query_wifi_ssid()
+    _wifi_cache[0] = ssid
+    _wifi_cache[1] = now
+    return ssid
+
+
+def _query_wifi_ssid() -> str:
+    """Do the actual system call to find the Wi-Fi SSID."""
     # system_profiler is the most reliable across macOS versions
     try:
         result = subprocess.run(
@@ -747,20 +903,83 @@ def fire_notification(title: str, body: str):
     run_applescript(f'display notification "{body}" with title "{title}"')
 
 
+# ---------------------------------------------------------------------------
+# Duration parsing — shared by timer and reminder so there's one source of
+# truth for how "5 minutes" becomes 300 seconds.
+# ---------------------------------------------------------------------------
+
+_DURATION_RE = re.compile(
+    r"(\d+)\s*(second|minute|hour|sec|min|hr)s?",
+    re.IGNORECASE,
+)
+
+_UNIT_TO_SECS: dict[str, int] = {
+    "second": 1,  "sec": 1,
+    "minute": 60, "min": 60,
+    "hour": 3600, "hr": 3600,
+}
+
+
+def _parse_duration(n: int, unit: str) -> int:
+    """Convert a (number, unit) pair to a total second count."""
+    return n * _UNIT_TO_SECS.get(unit.lower().rstrip("s"), 1)
+
+
+def _human_duration(n: int, unit: str) -> str:
+    """Return a natural label like '5 minutes' or '1 hour'."""
+    base = unit.lower().rstrip("s")
+    canonical = {"sec": "second", "min": "minute", "hr": "hour"}.get(base, base)
+    return f"{n} {canonical}{'s' if n != 1 else ''}"
+
+
+# ---------------------------------------------------------------------------
+# Timer and reminder — with proper cancellation support
+# ---------------------------------------------------------------------------
+
+class _CancellableTimer:
+    """A timer that can be cancelled before it fires."""
+
+    def __init__(self, seconds: int, label: str, callback):
+        self._cancel = threading.Event()
+        t = threading.Thread(
+            target=self._run,
+            args=(seconds, label, callback),
+            daemon=True,
+        )
+        t.start()
+
+    def cancel(self):
+        self._cancel.set()
+
+    def _run(self, seconds: int, label: str, callback):
+        fired = not self._cancel.wait(timeout=seconds)
+        if fired:
+            callback(label)
+
+
+# Registry so callers could cancel a timer by name in the future.
+_active_timers: dict[str, _CancellableTimer] = {}
+_active_reminders: dict[str, _CancellableTimer] = {}
+
+
 def set_timer(seconds: int, label: str):
-    def _fire():
-        time.sleep(seconds)
-        fire_notification("Oracle", f"Timer: {label}")
-        speak(f"Sir, your {label} timer is up.")
-    threading.Thread(target=_fire, daemon=True).start()
+    def _fire(lbl: str):
+        fire_notification("Oracle", f"Timer: {lbl}")
+        speak(f"Sir, your {lbl} timer is up.")
+        _active_timers.pop(lbl, None)
+
+    timer = _CancellableTimer(seconds, label, _fire)
+    _active_timers[label] = timer
 
 
 def set_reminder(task: str, seconds: int):
-    def _fire():
-        time.sleep(seconds)
-        fire_notification("Oracle", f"Reminder: {task}")
-        speak(f"Sir, just a reminder to {task}.")
-    threading.Thread(target=_fire, daemon=True).start()
+    def _fire(t: str):
+        fire_notification("Oracle", f"Reminder: {t}")
+        speak(f"Sir, just a reminder to {t}.")
+        _active_reminders.pop(t, None)
+
+    reminder = _CancellableTimer(seconds, task, _fire)
+    _active_reminders[task] = reminder
 
 
 # ---------------------------------------------------------------------------
@@ -881,267 +1100,401 @@ NATIVE_APPS: dict[str, str] = {
 
 # ---------------------------------------------------------------------------
 # Quick command handler — resolves obvious requests locally, no LLM call needed
-# Returns True if handled, False to fall through to the LLM.
+#
+# Architecture: a list of Intent objects, each pairing a compiled regex with
+# a handler function. handle_quick_command() iterates the list in order and
+# calls the first match. Adding a new command = appending one Intent.
+#
+# Returns True if the command was handled, False to fall through to the LLM.
 # ---------------------------------------------------------------------------
 
-def handle_quick_command(raw_input: str) -> bool:
-    text = raw_input.lower().strip().rstrip(".")
 
-    # Shutdown
-    if re.search(r"\b(shut down oracle|quit oracle|exit oracle|goodbye oracle|go offline)\b", text):
-        speak_blocking("Shutting down. Goodbye, Sir.")
-        sys.exit(0)
+@dataclass(frozen=True)
+class Intent:
+    """Pairs a compiled regex pattern with a handler.
 
-    # Introduction / who are you
-    if re.search(r"\b(who are you|introduce yourself|what are you|your name)\b", text):
-        speak(f"I'm Oracle, {OWNER_FIRST}'s personal AI assistant.")
-        speak(
-            "I run entirely on this Mac and handle everything from opening apps "
-            "and playing music, to answering questions and setting reminders."
-        )
-        speak(
-            f"I remember our conversations across sessions, and I keep track of "
-            f"whatever {OWNER_FIRST} needs me to know."
-        )
-        speak_blocking("Think of me as a quieter, more capable version of JARVIS, Sir.")
-        return True
+    The handler receives the re.Match object and the lowercased input text.
+    It should speak its response and return True (handled) or None/False to
+    allow the next intent to try.
+    """
+    pattern: re.Pattern
+    handler: Callable[[re.Match, str], bool]
 
-    # Workspace ritual — only fires on explicit request, never on generic wake
-    if re.search(r"\b(start my workspace|workspace mode|setup workspace)\b", text):
-        # Speak confirmation immediately on the worker thread before launching anything
-        speak_blocking("On it, Sir.")
-        def _ritual():
-            print("[Workspace] Opening VS Code")
+
+def _intent_shutdown(m: re.Match, text: str) -> bool:
+    speak_blocking("Shutting down. Goodbye, Sir.")
+    sys.exit(0)
+
+
+def _intent_introduce(m: re.Match, text: str) -> bool:
+    speak(f"I'm Oracle, {OWNER_FIRST}'s personal AI assistant.")
+    speak(
+        "I run entirely on this Mac and handle everything from opening apps "
+        "and playing music, to answering questions and setting reminders."
+    )
+    speak(
+        f"I remember our conversations across sessions, and I keep track of "
+        f"whatever {OWNER_FIRST} needs me to know."
+    )
+    speak_blocking("Think of me as a quieter, more capable version of JARVIS, Sir.")
+    return True
+
+
+def _intent_workspace(m: re.Match, text: str) -> bool:
+    speak_blocking("On it, Sir.")
+
+    def _ritual():
+        for app in WORKSPACE_CONFIG.get("apps", []):
+            print(f"[Workspace] Opening {app}")
             subprocess.Popen(
-                ["open", "-a", "Visual Studio Code"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                ["open", "-a", app],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             time.sleep(0.6)
-            print("[Workspace] Opening claude.ai")
+        for url in WORKSPACE_CONFIG.get("urls", []):
+            print(f"[Workspace] Opening {url}")
             subprocess.Popen(
-                ["open", "https://claude.ai"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                ["open", url],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             time.sleep(0.4)
-            print("[Workspace] Opening Paranoid on YouTube")
-            open_youtube("Paranoid Black Sabbath official audio")
-        threading.Thread(target=_ritual, name="workspace-ritual", daemon=True).start()
-        return True
+        music = WORKSPACE_CONFIG.get("music", "")
+        if music:
+            print(f"[Workspace] Playing {music}")
+            open_youtube(music)
 
-    # Close / quit an application
-    close_m = re.search(
-        r"(?:close|quit|kill|exit|force quit)\s+(.+)", text
+    threading.Thread(target=_ritual, name="workspace-ritual", daemon=True).start()
+    return True
+
+
+def _intent_close_app(m: re.Match, text: str) -> bool:
+    app_raw  = m.group(1).strip().rstrip(".")
+    app_name = NATIVE_APPS.get(app_raw, app_raw.title())
+    result   = subprocess.run(
+        ["osascript", "-e", f'tell application "{app_name}" to quit'],
+        capture_output=True, timeout=5,
     )
-    if close_m:
-        app_raw = close_m.group(1).strip().rstrip(".")
-        # Resolve friendly name to actual app name
-        app_name = NATIVE_APPS.get(app_raw, app_raw.title())
-        result = subprocess.run(
-            ["osascript", "-e", f'tell application "{app_name}" to quit'],
-            capture_output=True, timeout=5
+    if result.returncode == 0:
+        speak(f"Closed {app_raw}, Sir.")
+    else:
+        subprocess.run(["pkill", "-x", app_name], capture_output=True)
+        speak(f"Force quit {app_raw}, Sir.")
+    return True
+
+
+def _intent_stop_media(m: re.Match, text: str) -> bool:
+    stop_media()
+    speak("Stopped, Sir.")
+    return True
+
+
+def _intent_play_audio(m: re.Match, text: str) -> bool:
+    query = m.group(1).strip()
+    query = re.sub(r"^(a\s+)?(song|track|music)\s*$", "music", query)
+    if "spotify" in text:
+        open_in_browser(
+            "https://open.spotify.com/search/" + query.replace(" ", "%20")
         )
-        if result.returncode == 0:
-            speak(f"Closed {app_raw}, Sir.")
-        else:
-            # Hard kill via pkill as fallback
-            subprocess.run(["pkill", "-x", app_name], capture_output=True)
-            speak(f"Force quit {app_raw}, Sir.")
+        speak(f"Searching Spotify for {query}, Sir.")
         return True
+    speak(f"On it, Sir. Finding {query} now.")
+    play_audio(query)
+    return True
 
-    # Stop music / media
-    if re.search(
-        r"\b(stop|pause)\b.*(music|song|audio|playing|video|media)\b"
-        r"|\bstop playing\b|\bstop the music\b|\bstop media\b",
-        text
-    ):
-        stop_media()
-        speak("Stopped, Sir.")
-        return True
 
-    # Play audio — "play X", "play a song by X", "put on X"
-    play_m = re.search(
-        r"^(?:play|put on|start playing)\s+"
-        r"(?:(?:a\s+)?(?:song|track|music)\s+(?:by|from|called|named)\s+)?"
-        r"(?:something\s+by\s+)?"
-        r"(.+?)(?:\s+on\s+spotify)?$",
-        text
-    )
-    if play_m and "video" not in text and "youtube" not in text:
-        query = play_m.group(1).strip()
-        query = re.sub(r"^(a\s+)?(song|track|music)\s*$", "music", query)
-        if "spotify" in text:
-            open_in_browser("https://open.spotify.com/search/" + query.replace(" ", "%20"))
-            speak(f"Searching Spotify for {query}, Sir.")
+_VAGUE_YT_QUERIES: frozenset[str] = frozenset({
+    "any", "anything", "something", "a video", "any video",
+    "something good", "your choice", "whatever",
+})
+
+
+def _intent_play_youtube(m: re.Match, text: str) -> bool:
+    query = (m.group(1) or (m.lastindex >= 2 and m.group(2)) or "").strip()
+    if not query or query.lower() in _VAGUE_YT_QUERIES:
+        query = "trending music 2025"
+    open_youtube(query)
+    speak(f"Opening {query} on YouTube, Sir.")
+    return True
+
+
+def _intent_open(m: re.Match, text: str) -> bool:
+    target = m.group(1).strip().rstrip(".")
+    # Try known websites first (longest key wins)
+    for key in sorted(WEBSITES, key=len, reverse=True):
+        if key in target:
+            open_in_browser(WEBSITES[key])
+            speak(f"Opening {key}, Sir.")
             return True
-        speak(f"On it, Sir. Finding {query} now.")
-        play_audio(query)
-        return True
-
-    # Play YouTube video — opens browser (video streaming via afplay is not reliable)
-    yt_video_m = re.search(
-        r"(?:play|show me|watch|find)\s+(.+?)\s+(?:on\s+)?(?:youtube|yt)\b"
-        r"|(?:play|watch)\s+(?:a\s+)?(?:youtube\s+video|video\s+on\s+youtube)"
-        r"(?:\s+(?:of|about)\s+)?(.+)?",
-        text
-    )
-    if yt_video_m:
-        query = (yt_video_m.group(1) or yt_video_m.group(2) or "").strip()
-        # Replace vague queries with something actually useful
-        vague = {"any", "anything", "something", "a video", "any video",
-                 "something good", "your choice", "whatever"}
-        if not query or query.lower() in vague:
-            query = "trending music 2025"
-        open_youtube(query)
-        speak(f"Opening {query} on YouTube, Sir.")
-        return True
-
-    # Open a website or app
-    open_m = re.search(
-        r"(?:open|go to|pull up|launch|take me to|navigate to)\s+(.+)", text
-    )
-    if open_m:
-        target = open_m.group(1).strip().rstrip(".")
-        for key in sorted(WEBSITES, key=len, reverse=True):
-            if key in target:
-                open_in_browser(WEBSITES[key])
-                speak(f"Opening {key}, Sir.")
-                return True
-        for key in sorted(NATIVE_APPS, key=len, reverse=True):
-            if key in target:
-                launch_app(key)
-                speak(f"Opening {key}, Sir.")
-                return True
-        # Last resort: treat as a bare domain
-        bare = target.replace(" ", "")
-        if re.match(r"^[a-zA-Z0-9.\-]+$", bare):
-            if "." not in bare:
-                bare += ".com"
-            open_in_browser(f"https://{bare}")
-            speak(f"Opening {target}, Sir.")
+    # Then known native apps
+    for key in sorted(NATIVE_APPS, key=len, reverse=True):
+        if key in target:
+            launch_app(key)
+            speak(f"Opening {key}, Sir.")
             return True
-
-    # YouTube search (browse mode, not play)
-    yt_search_m = re.search(
-        r"(?:search|find|look up|show me)\s+(.+?)\s+(?:on\s+)?(?:youtube|yt)\b", text
-    )
-    if yt_search_m:
-        query = yt_search_m.group(1).strip()
-        open_youtube(query)
-        speak(f"Searching {query} on YouTube, Sir.")
+    # Last resort: bare domain
+    bare = target.replace(" ", "")
+    if re.match(r"^[a-zA-Z0-9.\-]+$", bare):
+        if "." not in bare:
+            bare += ".com"
+        open_in_browser(f"https://{bare}")
+        speak(f"Opening {target}, Sir.")
         return True
+    return False
 
+
+def _intent_yt_search(m: re.Match, text: str) -> bool:
+    query = m.group(1).strip()
+    open_youtube(query)
+    speak(f"Searching {query} on YouTube, Sir.")
+    return True
+
+
+def _intent_web_search(m: re.Match, text: str) -> bool:
+    query = m.group(1).strip().rstrip(".")
+    open_in_browser("https://www.google.com/search?q=" + query.replace(" ", "+"))
+    speak(f"Searching for {query}, Sir.")
+    return True
+
+
+def _intent_volume_set(m: re.Match, text: str) -> bool:
+    level = int(m.group(1))
+    set_volume(level)
+    speak(f"Volume set to {level}, Sir.")
+    return True
+
+
+def _intent_volume_up(m: re.Match, text: str) -> bool:
+    new = min(100, get_volume() + 15)
+    set_volume(new)
+    speak(f"Volume up to {new}, Sir.")
+    return True
+
+
+def _intent_volume_down(m: re.Match, text: str) -> bool:
+    new = max(0, get_volume() - 15)
+    set_volume(new)
+    speak(f"Volume down to {new}, Sir.")
+    return True
+
+
+def _intent_mute(m: re.Match, text: str) -> bool:
+    run_applescript("set volume output muted true")
+    speak("Muted, Sir.")
+    return True
+
+
+def _intent_unmute(m: re.Match, text: str) -> bool:
+    run_applescript("set volume output muted false")
+    speak("Unmuted, Sir.")
+    return True
+
+
+def _intent_battery(m: re.Match, text: str) -> bool:
+    speak(f"Battery is at {get_battery_status()}, Sir.")
+    return True
+
+
+def _intent_wifi(m: re.Match, text: str) -> bool:
+    speak(f"You're connected to {get_wifi_name()}, Sir.")
+    return True
+
+
+def _intent_time(m: re.Match, text: str) -> bool:
+    t = datetime.datetime.now().strftime("%-I:%M %p")
+    speak(f"It's {t}, Sir.")
+    return True
+
+
+def _intent_date(m: re.Match, text: str) -> bool:
+    d = datetime.datetime.now().strftime("%A, %B %-d, %Y")
+    speak(f"Today is {d}, Sir.")
+    return True
+
+
+def _intent_timer(m: re.Match, text: str) -> bool:
+    n    = int(m.group(1))
+    unit = m.group(2)
+    secs = _parse_duration(n, unit)
+    lbl  = _human_duration(n, unit)
+    set_timer(secs, lbl)
+    speak(f"Timer set for {lbl}, Sir.")
+    return True
+
+
+def _intent_remind(m: re.Match, text: str) -> bool:
+    task = m.group(1).strip()
+    n    = int(m.group(2))
+    unit = m.group(3)
+    secs = _parse_duration(n, unit)
+    lbl  = _human_duration(n, unit)
+    set_reminder(task, secs)
+    speak(f"I'll remind you to {task} in {lbl}, Sir.")
+    return True
+
+
+def _intent_screenshot(m: re.Match, text: str) -> bool:
+    ts   = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    path = os.path.expanduser(f"~/Desktop/oracle_{ts}.png")
+    subprocess.Popen(["screencapture", "-x", path])
+    speak("Screenshot saved to your Desktop, Sir.")
+    return True
+
+
+def _intent_lock(m: re.Match, text: str) -> bool:
+    run_applescript(
+        'tell application "System Events" to keystroke "q" '
+        'using {command down, control down}'
+    )
+    speak("Screen locked, Sir.")
+    return True
+
+
+def _intent_remember(m: re.Match, text: str) -> bool:
+    key   = m.group(1).strip().replace(" ", "_")
+    value = m.group(2).strip()
+    store_fact(key, value)
+    # Use the raw (un-replaced) key group for the spoken confirmation
+    spoken_key = m.group(1).strip()
+    speak(f"Noted, Sir. Your {spoken_key} is {value}.")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Intent registry — order matters: more specific patterns first.
+# ---------------------------------------------------------------------------
+
+_INTENTS: list[Intent] = [
+    Intent(
+        re.compile(r"\b(shut down oracle|quit oracle|exit oracle|goodbye oracle|go offline)\b"),
+        _intent_shutdown,
+    ),
+    Intent(
+        re.compile(r"\b(who are you|introduce yourself|what are you|your name)\b"),
+        _intent_introduce,
+    ),
+    Intent(
+        re.compile(r"\b(start my workspace|workspace mode|setup workspace)\b"),
+        _intent_workspace,
+    ),
+    # "close / quit / kill app" — must come before open so "close chrome" doesn't
+    # accidentally match an "open" intent
+    Intent(
+        re.compile(r"(?:close|quit|kill|exit|force quit)\s+(.+)"),
+        _intent_close_app,
+    ),
+    Intent(
+        re.compile(
+            r"\b(stop|pause)\b.*(music|song|audio|playing|video|media)\b"
+            r"|\bstop playing\b|\bstop the music\b|\bstop media\b"
+        ),
+        _intent_stop_media,
+    ),
+    # YouTube video playback (browser) — must come before generic play_audio
+    Intent(
+        re.compile(
+            r"(?:play|show me|watch|find)\s+(.+?)\s+(?:on\s+)?(?:youtube|yt)\b"
+            r"|(?:play|watch)\s+(?:a\s+)?(?:youtube\s+video|video\s+on\s+youtube)"
+            r"(?:\s+(?:of|about)\s+)?(.+)?"
+        ),
+        _intent_play_youtube,
+    ),
+    # Audio playback via yt-dlp — "play X", "put on X"
+    Intent(
+        re.compile(
+            r"^(?:play|put on|start playing)\s+"
+            r"(?:(?:a\s+)?(?:song|track|music)\s+(?:by|from|called|named)\s+)?"
+            r"(?:something\s+by\s+)?"
+            r"(.+?)(?:\s+on\s+spotify)?$"
+        ),
+        _intent_play_audio,
+    ),
+    # Open website/app — before YT search so "open youtube" routes here
+    Intent(
+        re.compile(r"(?:open|go to|pull up|launch|take me to|navigate to)\s+(.+)"),
+        _intent_open,
+    ),
+    # YouTube search (browse, not play)
+    Intent(
+        re.compile(r"(?:search|find|look up|show me)\s+(.+?)\s+(?:on\s+)?(?:youtube|yt)\b"),
+        _intent_yt_search,
+    ),
     # Web search
-    search_m = re.search(r"(?:search|google|look up|find)\s+(?:for\s+)?(.+)", text)
-    if search_m:
-        query = search_m.group(1).strip().rstrip(".")
-        open_in_browser("https://www.google.com/search?q=" + query.replace(" ", "+"))
-        speak(f"Searching for {query}, Sir.")
-        return True
-
-    # Volume controls
-    vol_num_m = re.search(r"(?:set\s+)?(?:the\s+)?volume\s+(?:to\s+)?(\d{1,3})", text)
-    if vol_num_m:
-        level = int(vol_num_m.group(1))
-        set_volume(level)
-        speak(f"Volume set to {level}, Sir.")
-        return True
-    if re.search(r"\bvolume\s+up\b|\bturn\s+(?:it\s+)?up\b|\braise\s+(?:the\s+)?volume\b", text):
-        new = min(100, get_volume() + 15)
-        set_volume(new)
-        speak(f"Volume up to {new}, Sir.")
-        return True
-    if re.search(r"\bvolume\s+down\b|\bturn\s+(?:it\s+)?down\b|\blower\s+(?:the\s+)?volume\b", text):
-        new = max(0, get_volume() - 15)
-        set_volume(new)
-        speak(f"Volume down to {new}, Sir.")
-        return True
-    if re.search(r"\b(mute|silence)\b", text) and "unmute" not in text:
-        run_applescript("set volume output muted true")
-        speak("Muted, Sir.")
-        return True
-    if re.search(r"\bunmute\b", text):
-        run_applescript("set volume output muted false")
-        speak("Unmuted, Sir.")
-        return True
-
+    Intent(
+        re.compile(r"(?:search|google|look up|find)\s+(?:for\s+)?(.+)"),
+        _intent_web_search,
+    ),
+    # Volume — set to specific number
+    Intent(
+        re.compile(r"(?:set\s+)?(?:the\s+)?volume\s+(?:to\s+)?(\d{1,3})"),
+        _intent_volume_set,
+    ),
+    Intent(
+        re.compile(r"\bvolume\s+up\b|\bturn\s+(?:it\s+)?up\b|\braise\s+(?:the\s+)?volume\b"),
+        _intent_volume_up,
+    ),
+    Intent(
+        re.compile(r"\bvolume\s+down\b|\bturn\s+(?:it\s+)?down\b|\blower\s+(?:the\s+)?volume\b"),
+        _intent_volume_down,
+    ),
+    # Unmute must come before mute so "unmute" doesn't match the mute pattern
+    Intent(re.compile(r"\bunmute\b"),                           _intent_unmute),
+    Intent(re.compile(r"\b(mute|silence)\b"),                   _intent_mute),
     # System status
-    if re.search(r"\b(battery|charge level|power level)\b", text):
-        speak(f"Battery is at {get_battery_status()}, Sir.")
-        return True
-
-    if re.search(r"\bwifi\b|\bnetwork name\b|\bwhat.*(?:network|wifi|connected)\b", text):
-        speak(f"You're connected to {get_wifi_name()}, Sir.")
-        return True
-
-    if re.search(r"\b(what.*time|current time|time is it|the time)\b", text):
-        t = datetime.datetime.now().strftime("%-I:%M %p")
-        speak(f"It's {t}, Sir.")
-        return True
-
-    if re.search(r"\b(what.*date|today.*date|what day|the date)\b", text):
-        d = datetime.datetime.now().strftime("%A, %B %-d, %Y")
-        speak(f"Today is {d}, Sir.")
-        return True
-
+    Intent(re.compile(r"\b(battery|charge level|power level)\b"), _intent_battery),
+    Intent(
+        re.compile(r"\bwifi\b|\bnetwork name\b|\bwhat.*(?:network|wifi|connected)\b"),
+        _intent_wifi,
+    ),
+    Intent(
+        re.compile(r"\b(what.*time|current time|time is it|the time)\b"),
+        _intent_time,
+    ),
+    Intent(
+        re.compile(r"\b(what.*date|today.*date|what day|the date)\b"),
+        _intent_date,
+    ),
     # Timer
-    timer_m = re.search(
-        r"(?:set|start|create)?\s*(?:a\s+)?timer\s+(?:for\s+)?(\d+)\s*"
-        r"(second|minute|hour|sec|min|hr)",
-        text
-    )
-    if timer_m:
-        n     = int(timer_m.group(1))
-        unit  = timer_m.group(2)
-        secs  = n * (3600 if "hour" in unit or unit == "hr"
-                     else 60 if "min" in unit else 1)
-        label = f"{n} {unit}{'s' if n > 1 else ''}"
-        set_timer(secs, label)
-        speak(f"Timer set for {label}, Sir.")
-        return True
-
+    Intent(
+        re.compile(
+            r"(?:set|start|create)?\s*(?:a\s+)?timer\s+(?:for\s+)?(\d+)\s*"
+            r"(second|minute|hour|sec|min|hr)"
+        ),
+        _intent_timer,
+    ),
     # Reminder
-    remind_m = re.search(
-        r"remind\s+(?:me\s+)?(?:to\s+)?(.+?)\s+in\s+(\d+)\s*"
-        r"(second|minute|hour|sec|min|hr)",
-        text
-    )
-    if remind_m:
-        task  = remind_m.group(1).strip()
-        n     = int(remind_m.group(2))
-        unit  = remind_m.group(3)
-        secs  = n * (3600 if "hour" in unit or unit == "hr"
-                     else 60 if "min" in unit else 1)
-        label = f"{n} {unit}{'s' if n > 1 else ''}"
-        set_reminder(task, secs)
-        speak(f"I'll remind you to {task} in {label}, Sir.")
-        return True
+    Intent(
+        re.compile(
+            r"remind\s+(?:me\s+)?(?:to\s+)?(.+?)\s+in\s+(\d+)\s*"
+            r"(second|minute|hour|sec|min|hr)"
+        ),
+        _intent_remind,
+    ),
+    Intent(
+        re.compile(r"\b(screenshot|capture screen|screen shot|take a screenshot)\b"),
+        _intent_screenshot,
+    ),
+    Intent(
+        re.compile(r"\b(lock screen|lock the screen|lock my screen)\b"),
+        _intent_lock,
+    ),
+    Intent(
+        re.compile(r"remember\s+(?:that\s+)?(?:my\s+)?(.+?)\s+is\s+(.+)"),
+        _intent_remember,
+    ),
+]
 
-    # Screenshot
-    if re.search(r"\b(screenshot|capture screen|screen shot|take a screenshot)\b", text):
-        ts   = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        path = os.path.expanduser(f"~/Desktop/oracle_{ts}.png")
-        subprocess.Popen(["screencapture", "-x", path])
-        speak("Screenshot saved to your Desktop, Sir.")
-        return True
 
-    # Lock screen
-    if re.search(r"\b(lock screen|lock the screen|lock my screen)\b", text):
-        run_applescript(
-            'tell application "System Events" to keystroke "q" '
-            'using {command down, control down}'
-        )
-        speak("Screen locked, Sir.")
-        return True
-
-    # Remember a fact
-    rem_m = re.search(r"remember\s+(?:that\s+)?(?:my\s+)?(.+?)\s+is\s+(.+)", text)
-    if rem_m:
-        key   = rem_m.group(1).strip().replace(" ", "_")
-        value = rem_m.group(2).strip()
-        store_fact(key, value)
-        speak(f"Noted, Sir. Your {rem_m.group(1)} is {value}.")
-        return True
-
+def handle_quick_command(raw_input: str) -> bool:
+    """Try every registered intent in order. Return True if one handled it."""
+    text = raw_input.lower().strip().rstrip(".")
+    for intent in _INTENTS:
+        match = intent.pattern.search(text)
+        if match:
+            # Handler may return falsy to signal it didn't actually handle it
+            # (e.g. _intent_open when the target isn't resolvable)
+            result = intent.handler(match, text)
+            if result:
+                return True
     return False
 
 
@@ -1213,47 +1566,63 @@ Examples of correct responses:
 _ACTION_EXEC_RE = re.compile(r"\[ACTION:([a-zA-Z_]+):?([^\]]*)\]")
 
 
+def _action_volume_up(_payload: str) -> None:
+    set_volume(min(100, get_volume() + 10))
+
+
+def _action_volume_down(_payload: str) -> None:
+    set_volume(max(0, get_volume() - 10))
+
+
+def _action_screenshot(_payload: str) -> None:
+    ts   = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    path = os.path.expanduser(f"~/Desktop/oracle_{ts}.png")
+    subprocess.Popen(["screencapture", "-x", path])
+
+
+def _action_lock_screen(_payload: str) -> None:
+    run_applescript(
+        'tell application "System Events" to keystroke "q" '
+        'using {command down, control down}'
+    )
+
+
+# Maps ACTION tag names → callable(payload: str) -> None
+_ACTION_DISPATCH: dict[str, callable] = {
+    "open_url":      lambda p: open_in_browser(p),
+    "open_app":      lambda p: launch_app(p),
+    "search_web":    lambda p: open_in_browser(
+                         "https://www.google.com/search?q=" + p.replace(" ", "+")),
+    "search_youtube": lambda p: open_youtube(p),
+    "play_audio":    lambda p: play_audio(p),
+    "open_spotify":  lambda _: launch_app("Spotify"),
+    "volume_set":    lambda p: set_volume(int(p)),
+    "volume_up":     _action_volume_up,
+    "volume_down":   _action_volume_down,
+    "screenshot":    _action_screenshot,
+    "lock_screen":   _action_lock_screen,
+    "stop_music":    lambda _: stop_media(),
+}
+
+
 def execute_action_tags(text: str) -> str:
-    """
-    Find all ACTION tags in text, execute them, and return the clean spoken text.
-    Called during LLM streaming so actions fire as soon as the tag is complete.
+    """Find all ACTION tags in text, execute them, and return the clean spoken text.
+
+    Called during LLM streaming so actions fire as soon as their tag is complete.
+    Unknown action names are silently skipped and logged — this future-proofs the
+    dispatch table against new tags being added to the system prompt.
     """
     for match in _ACTION_EXEC_RE.finditer(text):
         tag     = match.group(1).lower()
         payload = match.group(2).strip()
-        try:
-            if tag == "open_url":
-                open_in_browser(payload)
-            elif tag == "open_app":
-                launch_app(payload)
-            elif tag == "search_web":
-                open_in_browser("https://www.google.com/search?q=" + payload.replace(" ", "+"))
-            elif tag == "search_youtube":
-                open_youtube(payload)
-            elif tag == "play_audio":
-                play_audio(payload)
-            elif tag == "open_spotify":
-                launch_app("Spotify")
-            elif tag == "volume_set":
-                set_volume(int(payload))
-            elif tag == "volume_up":
-                set_volume(min(100, get_volume() + 10))
-            elif tag == "volume_down":
-                set_volume(max(0,   get_volume() - 10))
-            elif tag == "screenshot":
-                ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                subprocess.Popen(
-                    ["screencapture", "-x", os.path.expanduser(f"~/Desktop/oracle_{ts}.png")]
-                )
-            elif tag == "lock_screen":
-                run_applescript(
-                    'tell application "System Events" to keystroke "q" '
-                    'using {command down, control down}'
-                )
-            elif tag == "stop_music":
-                stop_media()
-        except Exception as e:
-            print(f"[Action error] {tag}({payload}): {e}")
+        handler = _ACTION_DISPATCH.get(tag)
+        if handler:
+            try:
+                handler(payload)
+            except Exception as e:
+                print(f"[Action error] {tag}({payload!r}): {e}")
+        else:
+            print(f"[Action] Unknown tag ignored: {tag!r}")
 
     return sanitize_for_speech(text)
 
@@ -1297,9 +1666,16 @@ def get_llm_response(user_text: str):
             if has_unclosed_bracket(token_buffer):
                 continue
 
-            # Extract all complete sentences from the buffer
+            # Extract all complete sentences from the buffer.
+            # The negative lookbehind prevents false splits on:
+            #   - Decimal numbers: "version 3.5 is" — the dot is not a sentence end
+            #   - Initials/abbrevs: "U.S. Army" — single uppercase letters flanking dots
+            #   - Numbers after punctuation: "priced at $2.99. Get it"
             while True:
-                match = re.search(r"(?<=[.!?])\s+", token_buffer)
+                match = re.search(
+                    r"(?<![A-Z\d])(?<=[.!?])\s+(?=[A-Z\"\(])",
+                    token_buffer,
+                )
                 if not match:
                     break
                 sentence     = token_buffer[:match.start() + 1].strip()
