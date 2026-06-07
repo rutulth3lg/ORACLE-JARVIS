@@ -1,0 +1,39 @@
+# Oracle — gitignore
+
+# Never commit the memory file (contains personal conversation history)
+oracle_memory.json
+
+# Temp audio files generated during runtime
+oracle_tmp/
+*.mp3
+*.wav
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# macOS junk
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+oracle.log
+*.log
+-e 
+# Environment secrets
+.env

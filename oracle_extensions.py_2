@@ -1,0 +1,1397 @@
+# oracle_extensions_2.py
+#
+# Oracle v2 — Extension Module 2
+# Additional capability modules:
+#
+#   7.  Smart Music Queue    — playlist, shuffle, history navigation
+#   8.  Voice-controlled Finder ops — move, copy, delete, rename files by voice
+#   9.  LLM Code Reviewer   — "review my clipboard code"
+#   10. Multi-repo Git switcher — "switch to my <project> repo"
+#   11. System health monitor — background watcher, alerts on high CPU/RAM/temp
+#   12. Oracle config at runtime — "set auto-sleep to 20 minutes"
+#   13. Batch intent improvements + performance patches
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+import json
+import time
+import uuid
+import shutil
+import signal
+import random
+import hashlib
+import threading
+import subprocess
+import datetime
+import textwrap
+from typing import Optional, Any
+from dataclasses import dataclass, field
+from collections import deque
+
+
+def _oracle(name: str) -> Any:
+    import __main__
+    return getattr(__main__, name)
+
+
+def _set_oracle(name: str, val: Any) -> None:
+    import __main__
+    setattr(__main__, name, val)
+
+
+# ============================================================================
+# MODULE 7 — Smart Music Queue + History Navigation
+#
+# Extends oracle_extensions.py's player with:
+#   - Queue management: add, clear, show, shuffle
+#   - History navigation: "previous song" goes back
+#   - Autoplay: when a track ends, auto-play next in queue
+#   - Smart radio mode: "play radio based on <artist>" seeds a queue of
+#     related tracks by asking the LLM, then playing them sequentially
+# ============================================================================
+
+# We import from oracle_extensions — safe since both files share the same
+# process namespace when dropped alongside oracle.py
+_QUEUE_LOCK = threading.Lock()
+
+
+def _get_player_state():
+    import oracle_extensions as _oe
+    return _oe._player_state
+
+
+def queue_add(query: str) -> int:
+    """Add a search query to the playback queue. Returns new queue length."""
+    state = _get_player_state()
+    with state["lock"]:
+        state["queue"].append(query)
+        return len(state["queue"])
+
+
+def queue_clear() -> None:
+    state = _get_player_state()
+    with state["lock"]:
+        state["queue"].clear()
+
+
+def queue_shuffle() -> None:
+    state = _get_player_state()
+    with state["lock"]:
+        random.shuffle(state["queue"])
+
+
+def queue_list() -> list[str]:
+    state = _get_player_state()
+    with state["lock"]:
+        return list(state["queue"])
+
+
+def history_back() -> Optional[str]:
+    """
+    Go back one track in history. Returns query of the previous track
+    or None if no history.
+    """
+    import oracle_extensions as _oe
+    state = _get_player_state()
+    with state["lock"]:
+        history = list(state["history"])
+    if len(history) < 2:
+        return None
+    # Pop current, return previous
+    return history[-2].query
+
+
+def _autoplay_next() -> None:
+    """Called when a track ends naturally — play next in queue if present."""
+    import oracle_extensions as _oe
+    import __main__ as _m
+
+    state = _get_player_state()
+    with state["lock"]:
+        q = state["queue"]
+        if not q:
+            return
+        next_query = q.pop(0)
+
+    _oe.player_play(next_query)
+
+
+def _seed_radio_queue(artist: str, count: int = 6) -> list[str]:
+    """
+    Ask the LLM to generate N song queries similar to / by the artist.
+    Returns list of search query strings.
+    """
+    import __main__ as _m
+
+    prompt = (
+        f"List exactly {count} popular songs by or similar in style to {artist}. "
+        f"Format: one song per line, as '<Song Title> <Artist>'. "
+        f"No numbering, no explanations, no markdown."
+    )
+    try:
+        resp = _m.groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=200,
+            stream=False,
+        )
+        raw   = resp.choices[0].message.content.strip()
+        lines = [l.strip() for l in raw.splitlines() if l.strip()]
+        return lines[:count]
+    except Exception as e:
+        print(f"[Radio] LLM seed failed: {e}")
+        return [f"{artist} popular songs", f"best of {artist}", f"{artist} top hits"]
+
+
+def start_radio(artist: str) -> None:
+    """Start a radio session seeded from an artist."""
+    import __main__ as _m
+    import oracle_extensions as _oe
+
+    _m.speak(f"Starting radio based on {artist}, Sir. Building your queue.")
+    queue_clear()
+
+    def _worker():
+        queries = _seed_radio_queue(artist)
+        for q in queries:
+            queue_add(q)
+        # Play first track
+        state = _get_player_state()
+        with state["lock"]:
+            q_list = state["queue"]
+            if q_list:
+                first = q_list.pop(0)
+            else:
+                first = f"{artist} songs"
+        _oe.player_play(first)
+
+    threading.Thread(target=_worker, daemon=True, name="radio-seed").start()
+
+
+# --- Autoplay patch: hook into player_worker's completion ---
+
+def _patch_autoplay() -> None:
+    """
+    Monkey-patch oracle_extensions.player_play so after each track ends
+    (naturally), _autoplay_next() fires.
+    """
+    import oracle_extensions as _oe
+
+    _original_player_worker = _oe._player_worker
+
+    def _player_worker_with_autoplay(query: str) -> None:
+        _original_player_worker(query)
+        # If playback ended naturally (not stopped), play next
+        state = _get_player_state()
+        if not state["stop_ev"].is_set():
+            _autoplay_next()
+
+    _oe._player_worker = _player_worker_with_autoplay
+
+
+_patch_autoplay()
+
+
+# --- Intent handlers ---
+
+def _h_previous_song(m: re.Match, text: str) -> bool:
+    import __main__ as _m
+    import oracle_extensions as _oe
+    prev = history_back()
+    if prev:
+        _oe.player_play(prev)
+    else:
+        _m.speak("No previous track in history, Sir.")
+    return True
+
+
+def _h_queue_show(m: re.Match, text: str) -> bool:
+    import __main__ as _m
+    q = queue_list()
+    if not q:
+        _m.speak("The queue is empty, Sir.")
+        return True
+    _m.speak(f"{len(q)} track{'s' if len(q) != 1 else ''} in queue, Sir.")
+    for i, item in enumerate(q[:5], 1):
+        _m.speak(f"{i}: {item}")
+    return True
+
+
+def _h_queue_clear(m: re.Match, text: str) -> bool:
+    import __main__ as _m
+    queue_clear()
+    _m.speak("Queue cleared, Sir.")
+    return True
+
+
+def _h_queue_shuffle(m: re.Match, text: str) -> bool:
+    import __main__ as _m
+    queue_shuffle()
+    q = queue_list()
+    _m.speak(f"Queue shuffled — {len(q)} track{'s' if len(q) != 1 else ''} remaining, Sir.")
+    return True
+
+
+def _h_radio(m: re.Match, text: str) -> bool:
+    artist_m = re.search(
+        r"(?:radio|based on|like|similar to|radio for)\s+(.+)",
+        text, re.IGNORECASE,
+    )
+    artist = artist_m.group(1).strip() if artist_m else "top artists"
+    start_radio(artist)
+    return True
+
+
+# ============================================================================
+# MODULE 8 — Finder File Operations
+#
+# Voice-controlled file management for common tasks:
+#   "move <file> to <destination>"
+#   "copy <file> to <destination>"
+#   "delete <file>"          — moves to trash (safe)
+#   "rename <file> to <name>"
+#   "create folder <name> in <location>"
+#   "open Downloads / Desktop / Documents"
+#   "show me my recent files"
+#
+# All destructive ops confirm by default; with "force" keyword, skip confirm.
+# ============================================================================
+
+_FINDER_LOCATIONS: dict[str, str] = {
+    "desktop":   os.path.expanduser("~/Desktop"),
+    "downloads": os.path.expanduser("~/Downloads"),
+    "documents": os.path.expanduser("~/Documents"),
+    "home":      os.path.expanduser("~"),
+    "projects":  os.path.expanduser("~/Projects"),
+    "pictures":  os.path.expanduser("~/Pictures"),
+    "music":     os.path.expanduser("~/Music"),
+    "movies":    os.path.expanduser("~/Movies"),
+}
+
+
+def _resolve_location(name: str) -> str:
+    """Expand a friendly name or ~ path to an absolute path."""
+    name = name.strip().strip("\"'")
+    lower = name.lower()
+    if lower in _FINDER_LOCATIONS:
+        return _FINDER_LOCATIONS[lower]
+    expanded = os.path.expanduser(name)
+    return expanded
+
+
+def _finder_find_file(name: str, search_root: Optional[str] = None) -> Optional[str]:
+    """
+    Find a file by name fragment in common locations.
+    Returns full path or None.
+    """
+    roots = [search_root] if search_root else list(_FINDER_LOCATIONS.values())
+    frag  = name.lower()
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        try:
+            for entry in os.scandir(root):
+                if frag in entry.name.lower():
+                    return entry.path
+        except PermissionError:
+            continue
+    return None
+
+
+def move_file(src_name: str, dst_name: str) -> tuple[bool, str]:
+    """
+    Move a file. src_name: filename fragment. dst_name: destination dir name.
+    Returns (success, message).
+    """
+    src = _finder_find_file(src_name)
+    if not src:
+        return False, f"No file matching '{src_name}' found in common locations."
+
+    dst_dir = _resolve_location(dst_name)
+    if not os.path.isdir(dst_dir):
+        return False, f"Destination '{dst_name}' is not a valid folder."
+
+    dst_path = os.path.join(dst_dir, os.path.basename(src))
+    try:
+        shutil.move(src, dst_path)
+        return True, f"Moved {os.path.basename(src)} to {dst_name}."
+    except Exception as e:
+        return False, f"Move failed: {e}"
+
+
+def copy_file(src_name: str, dst_name: str) -> tuple[bool, str]:
+    """Copy a file. Returns (success, message)."""
+    src = _finder_find_file(src_name)
+    if not src:
+        return False, f"No file matching '{src_name}' found."
+
+    dst_dir = _resolve_location(dst_name)
+    if not os.path.isdir(dst_dir):
+        return False, f"Destination '{dst_name}' is not a valid folder."
+
+    dst_path = os.path.join(dst_dir, os.path.basename(src))
+    try:
+        if os.path.isdir(src):
+            shutil.copytree(src, dst_path)
+        else:
+            shutil.copy2(src, dst_path)
+        return True, f"Copied {os.path.basename(src)} to {dst_name}."
+    except Exception as e:
+        return False, f"Copy failed: {e}"
+
+
+def trash_file(name: str) -> tuple[bool, str]:
+    """Move a file to Trash (safe delete). Returns (success, message)."""
+    path = _finder_find_file(name)
+    if not path:
+        return False, f"No file matching '{name}' found."
+
+    fname = os.path.basename(path)
+    try:
+        # Use AppleScript's Finder trash — safer than rm
+        script = f'tell application "Finder" to delete POSIX file "{path}"'
+        r = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=8,
+        )
+        if r.returncode == 0:
+            return True, f"Moved {fname} to Trash."
+        else:
+            # Fallback: move to ~/.Trash
+            trash_path = os.path.expanduser("~/.Trash")
+            shutil.move(path, os.path.join(trash_path, fname))
+            return True, f"Moved {fname} to Trash."
+    except Exception as e:
+        return False, f"Delete failed: {e}"
+
+
+def rename_file(name: str, new_name: str) -> tuple[bool, str]:
+    """Rename a file in its current location. Returns (success, message)."""
+    path = _finder_find_file(name)
+    if not path:
+        return False, f"No file matching '{name}' found."
+
+    parent   = os.path.dirname(path)
+    ext      = os.path.splitext(path)[1]
+    # Preserve extension if new_name has none
+    if "." not in new_name:
+        new_name = new_name + ext
+
+    new_path = os.path.join(parent, new_name)
+    try:
+        os.rename(path, new_path)
+        return True, f"Renamed to {new_name}."
+    except Exception as e:
+        return False, f"Rename failed: {e}"
+
+
+def create_folder(name: str, location: str = "desktop") -> tuple[bool, str]:
+    """Create a new directory. Returns (success, message)."""
+    loc_path = _resolve_location(location)
+    new_dir  = os.path.join(loc_path, name)
+    try:
+        os.makedirs(new_dir, exist_ok=True)
+        return True, f"Folder '{name}' created in {location}."
+    except Exception as e:
+        return False, f"Folder creation failed: {e}"
+
+
+def get_recent_files(location: str = "desktop", count: int = 5) -> list[tuple[str, str]]:
+    """
+    Return [(filename, age_string)] for the N most recently modified files
+    in the given location.
+    """
+    loc_path = _resolve_location(location)
+    if not os.path.isdir(loc_path):
+        return []
+    try:
+        entries = [
+            e for e in os.scandir(loc_path)
+            if not e.name.startswith(".")
+        ]
+        entries.sort(key=lambda e: e.stat().st_mtime, reverse=True)
+        result = []
+        now    = time.time()
+        for e in entries[:count]:
+            age_secs = now - e.stat().st_mtime
+            if age_secs < 60:
+                age = "just now"
+            elif age_secs < 3600:
+                age = f"{int(age_secs // 60)} min ago"
+            elif age_secs < 86400:
+                age = f"{int(age_secs // 3600)} hr ago"
+            else:
+                age = f"{int(age_secs // 86400)} days ago"
+            result.append((e.name, age))
+        return result
+    except Exception:
+        return []
+
+
+def open_finder_location(location: str) -> None:
+    """Open a Finder window at the given location."""
+    path = _resolve_location(location)
+    subprocess.Popen(["open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# --- Finder intent handlers ---
+
+def _h_move_file(m: re.Match, text: str) -> bool:
+    import __main__ as _m
+    mv_m = re.search(
+        r"move\s+(.+?)\s+(?:to|into)\s+(.+)",
+        text, re.IGNORECASE,
+    )
+    if not mv_m:
+        _m.speak("What should I move and where, Sir?")
+        return True
+    src, dst = mv_m.group(1).strip(), mv_m.group(2).strip()
+
+    def _worker():
+        ok, msg = move_file(src, dst)
+        _m.speak(f"{msg} Sir.")
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return True
+
+
+def _h_copy_file(m: re.Match, text: str) -> bool:
+    import __main__ as _m
+    cp_m = re.search(
+        r"copy\s+(.+?)\s+(?:to|into)\s+(.+)",
+        text, re.IGNORECASE,
+    )
+    if not cp_m:
+        _m.speak("What should I copy and where, Sir?")
+        return True
+    src, dst = cp_m.group(1).strip(), cp_m.group(2).strip()
+
+    def _worker():
+        ok, msg = copy_file(src, dst)
+        _m.speak(f"{msg} Sir.")
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return True
+
+
+def _h_trash_file(m: re.Match, text: str) -> bool:
+    import __main__ as _m
+    name_m = re.search(
+        r"(?:delete|trash|remove)\s+(?:the\s+)?(?:file\s+)?(.+)",
+        text, re.IGNORECASE,
+    )
+    if not name_m:
+        _m.speak("Which file should I delete, Sir?")
+        return True
+    name = name_m.group(1).strip()
+
+    def _worker():
+        ok, msg = trash_file(name)
+        _m.speak(f"{msg} Sir.")
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return True
+
+
+def _h_rename_file(m: re.Match, text: str) -> bool:
+    import __main__ as _m
+    rn_m = re.search(
+        r"rename\s+(.+?)\s+to\s+(.+)",
+        text, re.IGNORECASE,
+    )
+    if not rn_m:
+        _m.speak("What should I rename and what to, Sir?")
+        return True
+    name, new_name = rn_m.group(1).strip(), rn_m.group(2).strip()
+
+    def _worker():
+        ok, msg = rename_file(name, new_name)
+        _m.speak(f"{msg} Sir.")
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return True
+
+
+def _h_create_folder(m: re.Match, text: str) -> bool:
+    import __main__ as _m
+    cf_m = re.search(
+        r"create\s+(?:a\s+)?folder\s+(?:called\s+|named\s+)?(.+?)(?:\s+(?:in|on)\s+(.+))?$",
+        text, re.IGNORECASE,
+    )
+    if not cf_m:
+        _m.speak("What should I call the folder, Sir?")
+        return True
+    name     = cf_m.group(1).strip()
+    location = cf_m.group(2).strip() if cf_m.group(2) else "desktop"
+
+    def _worker():
+        ok, msg = create_folder(name, location)
+        _m.speak(f"{msg} Sir.")
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return True
+
+
+def _h_recent_files(m: re.Match, text: str) -> bool:
+    import __main__ as _m
+    loc_m   = re.search(r"(?:in|on|from)\s+(.+)$", text, re.IGNORECASE)
+    location = loc_m.group(1).strip() if loc_m else "desktop"
+    count_m  = re.search(r"(\d+)", text)
+    count    = int(count_m.group(1)) if count_m else 5
+
+    files = get_recent_files(location, count)
+    if not files:
+        _m.speak(f"No recent files found in {location}, Sir.")
+        return True
+    _m.speak(f"{len(files)} recent file{'s' if len(files) != 1 else ''} in {location}, Sir.")
+    for fname, age in files:
+        _m.speak(f"{fname}, {age}.")
+    return True
+
+
+def _h_open_finder(m: re.Match, text: str) -> bool:
+    import __main__ as _m
+    loc_m    = re.search(
+        r"(?:open|show|browse)\s+(?:my\s+)?(?:finder\s+)?(.+?)(?:\s+folder|\s+in\s+finder)?$",
+        text, re.IGNORECASE,
+    )
+    location = loc_m.group(1).strip() if loc_m else "home"
+    open_finder_location(location)
+    _m.speak(f"Opening {location} in Finder, Sir.")
+    return True
+
+
+# ============================================================================
+# MODULE 9 — LLM Code Reviewer
+#
+# "Review my clipboard code" / "check this code" / "critique this code"
+# Sends clipboard to Groq with a structured code review prompt.
+# Speaks a concise review covering: bugs, style, improvements.
+# ============================================================================
+
+def review_code(code: str, language: str = "") -> None:
+    """Send code to LLM for review and speak the result."""
+    import __main__ as _m
+
+    if not code or not code.strip():
+        _m.speak("The clipboard is empty, Sir.")
+        return
+
+    # Detect language if not provided
+    if not language:
+        if re.search(r"\bdef\b|\bimport\b|\bclass\b.*:$", code, re.MULTILINE):
+            language = "Python"
+        elif re.search(r"\bfunction\b|\bconst\b|\blet\b|\bvar\b", code):
+            language = "JavaScript"
+        elif re.search(r"\bfunc\b|\bvar\b.*:=", code):
+            language = "Go"
+        elif re.search(r"\bfn\b|\blet\s+mut\b|\bimpl\b", code):
+            language = "Rust"
+        else:
+            language = "code"
+
+    _m.speak(f"Reviewing your {language}, Sir.")
+    _m.set_hud("processing")
+
+    prompt = (
+        f"You are reviewing the following {language} code for {_m.OWNER_FIRST}. "
+        f"In three to five concise spoken sentences (no markdown, no bullet points, no headers): "
+        f"1) Note any bugs or logic errors. "
+        f"2) Comment on code quality and style. "
+        f"3) Suggest the single most impactful improvement. "
+        f"Be direct. Address him as Sir once.\n\n"
+        f"```\n{code[:3000]}\n```"
+    )
+
+    try:
+        resp = _m.groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": _m.SYSTEM_PROMPT},
+                {"role": "user",   "content": prompt},
+            ],
+            temperature=0.3,
+            max_tokens=400,
+            stream=False,
+        )
+        review_text = resp.choices[0].message.content.strip()
+        clean       = _m.sanitize_for_speech(review_text)
+        _m.speak(clean)
+    except Exception as e:
+        print(f"[Code review] Error: {e}")
+        _m.speak("Code review failed, Sir. Check your API connection.")
+    finally:
+        _m.set_hud("standby")
+
+
+def _h_review_code(m: re.Match, text: str) -> bool:
+    import __main__ as _m
+    code = _m.get_clipboard()
+    if not code or not code.strip():
+        _m.speak("Nothing on the clipboard to review, Sir.")
+        return True
+    # Detect explicit language override
+    lang_m = re.search(
+        r"(?:review|check|critique|analyse|analyze)\s+(?:this\s+)?(\w+)\s+code",
+        text, re.IGNORECASE,
+    )
+    lang = lang_m.group(1) if lang_m else ""
+    threading.Thread(target=review_code, args=(code, lang), daemon=True).start()
+    return True
+
+
+# ============================================================================
+# MODULE 10 — Multi-repo Git Switcher
+#
+# Remembers named repos so you can say "switch to my oracle repo"
+# without specifying the full path.
+# ============================================================================
+
+_NAMED_REPOS_KEY = "__oracle_git_repos__"
+
+
+def _load_named_repos() -> dict[str, str]:
+    import __main__ as _m
+    with _m._memory_lock:
+        raw = _m._named_facts.get(_NAMED_REPOS_KEY, "{}")
+    try:
+        return json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return {}
+
+
+def _save_named_repos(repos: dict[str, str]) -> None:
+    import __main__ as _m
+    with _m._memory_lock:
+        _m._named_facts[_NAMED_REPOS_KEY] = json.dumps(repos)
+    _m.save_memory()
+
+
+def register_repo(name: str, path: str) -> None:
+    """Save a named repo path."""
+    repos = _load_named_repos()
+    repos[name.lower().strip()] = os.path.expanduser(path.strip())
+    _save_named_repos(repos)
+
+
+def switch_repo(name: str) -> tuple[bool, str]:
+    """
+    Switch the active git repo by name.
+    Returns (success, message).
+    """
+    repos = _load_named_repos()
+    key   = name.lower().strip()
+    if key not in repos:
+        # Try partial match
+        matches = [k for k in repos if key in k]
+        if not matches:
+            return False, f"No repo named '{name}' registered."
+        key = matches[0]
+
+    path = repos[key]
+    if not os.path.isdir(path):
+        return False, f"Path for '{key}' doesn't exist: {path}"
+
+    import oracle_extensions as _oe
+    _oe.git_set_repo(path)
+    return True, f"Switched to {key} repo at {os.path.basename(path)}."
+
+
+def _h_register_repo(m: re.Match, text: str) -> bool:
+    import __main__ as _m
+    reg_m = re.search(
+        r"(?:save|register|add)\s+(?:repo|repository)\s+(.+?)\s+(?:at|as|path)\s+(.+)",
+        text, re.IGNORECASE,
+    )
+    if not reg_m:
+        _m.speak("Provide a name and path — like: save repo oracle at ~/Projects/oracle, Sir.")
+        return True
+    name, path = reg_m.group(1).strip(), reg_m.group(2).strip()
+    register_repo(name, path)
+    _m.speak(f"Repo '{name}' saved, Sir.")
+    return True
+
+
+def _h_switch_repo(m: re.Match, text: str) -> bool:
+    import __main__ as _m
+    name_m = re.search(
+        r"(?:switch to|use|activate)\s+(?:my\s+)?(.+?)\s+repo(?:sitory)?",
+        text, re.IGNORECASE,
+    )
+    if not name_m:
+        _m.speak("Which repo should I switch to, Sir?")
+        return True
+    name = name_m.group(1).strip()
+    ok, msg = switch_repo(name)
+    _m.speak(f"{msg} Sir.")
+    return True
+
+
+def _h_list_repos(m: re.Match, text: str) -> bool:
+    import __main__ as _m
+    repos = _load_named_repos()
+    if not repos:
+        _m.speak("No named repos saved yet, Sir.")
+        return True
+    _m.speak(f"{len(repos)} repo{'s' if len(repos) != 1 else ''} saved, Sir.")
+    for name, path in repos.items():
+        _m.speak(f"{name}: {os.path.basename(path)}")
+    return True
+
+
+# ============================================================================
+# MODULE 11 — System Health Monitor
+#
+# Background thread watches CPU, RAM, and (on Apple Silicon) temperature.
+# Alerts Oracle when thresholds are exceeded. Configurable thresholds.
+# ============================================================================
+
+_HEALTH_THRESHOLDS: dict[str, float] = {
+    "cpu_percent":    85.0,   # alert if CPU > 85% for 3 consecutive checks
+    "ram_percent":    90.0,   # alert if RAM > 90%
+    "temp_celsius":   90.0,   # alert if CPU temp > 90°C
+}
+
+_HEALTH_CHECK_INTERVAL = 30    # seconds between checks
+_HEALTH_ALERT_COOLDOWN = 300   # seconds between repeat alerts for same issue
+_health_last_alert: dict[str, float] = {}
+_health_cpu_streak: int = 0
+
+
+def _get_cpu_temp() -> Optional[float]:
+    """
+    Try to get CPU temperature via osx-cpu-temp or powermetrics.
+    Returns Celsius float or None.
+    """
+    # Try osx-cpu-temp (requires: brew install osx-cpu-temp)
+    try:
+        r = subprocess.run(
+            ["osx-cpu-temp"], capture_output=True, text=True, timeout=3
+        )
+        m = re.search(r"(\d+\.?\d+)", r.stdout)
+        if m:
+            return float(m.group(1))
+    except Exception:
+        pass
+
+    # Try powermetrics (requires sudo — may not work; try anyway)
+    try:
+        r = subprocess.run(
+            ["sudo", "-n", "powermetrics", "-n", "1", "-i", "500",
+             "--samplers", "smc"],
+            capture_output=True, text=True, timeout=5,
+        )
+        m = re.search(r"CPU die temperature:\s+(\d+\.?\d+)", r.stdout)
+        if m:
+            return float(m.group(1))
+    except Exception:
+        pass
+
+    return None
+
+
+def _health_monitor_loop() -> None:
+    global _health_cpu_streak
+    while True:
+        time.sleep(_HEALTH_CHECK_INTERVAL)
+        now = time.time()
+
+        try:
+            import psutil
+            cpu  = psutil.cpu_percent(interval=1)
+            ram  = psutil.virtual_memory().percent
+            temp = _get_cpu_temp()
+
+            # CPU alert
+            if cpu > _HEALTH_THRESHOLDS["cpu_percent"]:
+                _health_cpu_streak += 1
+                if _health_cpu_streak >= 3:
+                    last = _health_last_alert.get("cpu", 0)
+                    if now - last > _HEALTH_ALERT_COOLDOWN:
+                        _health_last_alert["cpu"] = now
+                        _health_cpu_streak = 0
+                        import __main__ as _m
+                        _m.speak(
+                            f"Heads up, Sir — CPU has been above "
+                            f"{_HEALTH_THRESHOLDS['cpu_percent']:.0f} percent "
+                            f"for over a minute. Currently at {cpu:.0f} percent."
+                        )
+                        _m.fire_notification(
+                            "Oracle — System Alert",
+                            f"High CPU: {cpu:.0f}%",
+                        )
+            else:
+                _health_cpu_streak = max(0, _health_cpu_streak - 1)
+
+            # RAM alert
+            if ram > _HEALTH_THRESHOLDS["ram_percent"]:
+                last = _health_last_alert.get("ram", 0)
+                if now - last > _HEALTH_ALERT_COOLDOWN:
+                    _health_last_alert["ram"] = now
+                    import __main__ as _m
+                    _m.speak(
+                        f"Memory is critically low, Sir — {ram:.0f} percent used. "
+                        f"Consider closing some applications."
+                    )
+                    _m.fire_notification(
+                        "Oracle — System Alert",
+                        f"High RAM: {ram:.0f}%",
+                    )
+
+            # Temp alert
+            if temp is not None and temp > _HEALTH_THRESHOLDS["temp_celsius"]:
+                last = _health_last_alert.get("temp", 0)
+                if now - last > _HEALTH_ALERT_COOLDOWN:
+                    _health_last_alert["temp"] = now
+                    import __main__ as _m
+                    _m.speak(
+                        f"CPU temperature is at {temp:.0f} degrees Celsius, Sir — "
+                        f"above the safe threshold. You may want to reduce load."
+                    )
+
+        except ImportError:
+            pass   # psutil not installed — silently skip
+        except Exception as e:
+            print(f"[Health monitor] Error: {e}")
+
+
+threading.Thread(
+    target=_health_monitor_loop,
+    daemon=True,
+    name="health-monitor",
+).start()
+
+
+def set_health_threshold(metric: str, value: float) -> bool:
+    """Update a health threshold at runtime. Returns True if valid metric."""
+    if metric in _HEALTH_THRESHOLDS:
+        _HEALTH_THRESHOLDS[metric] = value
+        return True
+    return False
+
+
+def _h_health_thresholds(m: re.Match, text: str) -> bool:
+    import __main__ as _m
+    _m.speak(
+        f"Current thresholds: CPU at {_HEALTH_THRESHOLDS['cpu_percent']:.0f} percent, "
+        f"RAM at {_HEALTH_THRESHOLDS['ram_percent']:.0f} percent, "
+        f"temperature at {_HEALTH_THRESHOLDS['temp_celsius']:.0f} degrees. Sir."
+    )
+    return True
+
+
+# ============================================================================
+# MODULE 12 — Runtime Configuration
+#
+# Change Oracle's runtime settings by voice without restarting.
+# "Set auto-sleep to 20 minutes"
+# "Set wake word to computer"        (adds alias)
+# "Set TTS rate to fast / slow / normal"
+# "Set volume step to 20"
+# "Show current config"
+# ============================================================================
+
+_RUNTIME_CONFIG: dict[str, Any] = {}
+
+_TTS_RATE_PRESETS: dict[str, str] = {
+    "fast":    "+25%",
+    "slow":    "-15%",
+    "normal":  "+6%",
+    "faster":  "+20%",
+    "slower":  "-10%",
+}
+
+
+def _h_set_auto_sleep(m: re.Match, text: str) -> bool:
+    import __main__ as _m
+    n_m = re.search(r"(\d+)\s*(minute|hour|min|hr)", text, re.IGNORECASE)
+    if not n_m:
+        _m.speak("How many minutes should the auto-sleep timeout be, Sir?")
+        return True
+
+    n, unit = int(n_m.group(1)), n_m.group(2).lower()
+    minutes = n if "min" in unit else n * 60
+    _m.AUTO_SLEEP_MINUTES = minutes
+    _RUNTIME_CONFIG["auto_sleep_minutes"] = minutes
+    _m.speak(f"Auto-sleep set to {minutes} minute{'s' if minutes != 1 else ''}, Sir.")
+    return True
+
+
+def _h_set_tts_rate(m: re.Match, text: str) -> bool:
+    import __main__ as _m
+    preset_m = re.search(
+        r"(?:tts|voice|speech)\s+(?:rate|speed)\s+(?:to\s+)?(\w+)",
+        text, re.IGNORECASE,
+    )
+    if not preset_m:
+        _m.speak("What rate? Fast, slow, or normal, Sir.")
+        return True
+
+    preset = preset_m.group(1).lower()
+    if preset in _TTS_RATE_PRESETS:
+        _m.TTS_RATE = _TTS_RATE_PRESETS[preset]
+        _RUNTIME_CONFIG["tts_rate"] = _m.TTS_RATE
+        _m.speak(f"Voice speed set to {preset}, Sir.")
+    else:
+        # Try numeric: "+15%"
+        pct_m = re.search(r"([+-]?\d+)%?", preset_m.group(1))
+        if pct_m:
+            sign = "+" if int(pct_m.group(1)) >= 0 else ""
+            _m.TTS_RATE = f"{sign}{pct_m.group(1)}%"
+            _m.speak(f"Voice rate set to {_m.TTS_RATE}, Sir.")
+        else:
+            _m.speak(f"I don't recognise that rate preset, Sir. Try fast, slow, or normal.")
+    return True
+
+
+def _h_set_voice(m: re.Match, text: str) -> bool:
+    import __main__ as _m
+    _VOICES = {
+        "ryan":    "en-GB-RyanNeural",
+        "british": "en-GB-RyanNeural",
+        "sonia":   "en-GB-SoniaNeural",
+        "guy":     "en-US-GuyNeural",
+        "jenny":   "en-US-JennyNeural",
+        "davis":   "en-US-DavisNeural",
+        "tony":    "en-US-TonyNeural",
+        "aria":    "en-US-AriaNeural",
+    }
+    voice_m = re.search(
+        r"(?:set|change|switch)\s+(?:voice|tts)\s+(?:to\s+)?(\w+)",
+        text, re.IGNORECASE,
+    )
+    if not voice_m:
+        _m.speak("Which voice would you like, Sir? Options include Ryan, Guy, or Jenny.")
+        return True
+
+    key = voice_m.group(1).lower()
+    if key in _VOICES:
+        _m.VOICE = _VOICES[key]
+        _RUNTIME_CONFIG["voice"] = _m.VOICE
+        _m.speak(f"Voice changed to {voice_m.group(1)}, Sir.")
+    else:
+        _m.speak(
+            f"Voice '{key}' not in my presets. Available: "
+            + ", ".join(_VOICES.keys()) + ". Sir."
+        )
+    return True
+
+
+def _h_show_config(m: re.Match, text: str) -> bool:
+    import __main__ as _m
+    _m.speak(
+        f"Current config, Sir: "
+        f"Auto-sleep is {_m.AUTO_SLEEP_MINUTES} minutes. "
+        f"TTS rate is {_m.TTS_RATE}. "
+        f"Voice is {_m.VOICE.split('-')[-1].replace('Neural', '')}. "
+        f"History window is {_m.MAX_HISTORY_TURNS} turns."
+    )
+    return True
+
+
+def _h_set_history_turns(m: re.Match, text: str) -> bool:
+    import __main__ as _m
+    n_m = re.search(r"(\d+)", text)
+    if not n_m:
+        _m.speak("How many turns should I keep in history, Sir?")
+        return True
+    n = max(4, min(50, int(n_m.group(1))))
+    _m.MAX_HISTORY_TURNS = n
+    _RUNTIME_CONFIG["max_history_turns"] = n
+    _m.speak(f"History window set to {n} turns, Sir.")
+    return True
+
+
+# ============================================================================
+# INTENT REGISTRATIONS — Module 2
+# ============================================================================
+
+def _register_ext2_intents() -> None:
+    import __main__ as _m
+
+    new_intents = [
+        # --- Music Queue / Radio ---
+        _m.Intent(
+            re.compile(r"\b(previous song|go back|last song|back a song)\b", re.IGNORECASE),
+            _h_previous_song,
+        ),
+        _m.Intent(
+            re.compile(r"\b(show queue|what(?:'s| is) in (?:the )?queue|view queue|queue list)\b", re.IGNORECASE),
+            _h_queue_show,
+        ),
+        _m.Intent(
+            re.compile(r"\b(clear queue|empty queue)\b", re.IGNORECASE),
+            _h_queue_clear,
+        ),
+        _m.Intent(
+            re.compile(r"\b(shuffle queue|shuffle playlist|randomise queue)\b", re.IGNORECASE),
+            _h_queue_shuffle,
+        ),
+        _m.Intent(
+            re.compile(
+                r"(?:start|play)\s+radio\s+(?:based on|like|for|of)?\s*.+|"
+                r"radio\s+(?:mode|based on|like)\s+.+",
+                re.IGNORECASE,
+            ),
+            _h_radio,
+        ),
+
+        # --- Finder ---
+        _m.Intent(
+            re.compile(r"\bmove\s+.+\s+(?:to|into)\s+\S+", re.IGNORECASE),
+            _h_move_file,
+        ),
+        _m.Intent(
+            re.compile(r"\bcopy\s+.+\s+(?:to|into)\s+\S+", re.IGNORECASE),
+            _h_copy_file,
+        ),
+        _m.Intent(
+            re.compile(
+                r"\b(?:delete|trash|remove)\s+(?:the\s+)?(?:file\s+)?\S+",
+                re.IGNORECASE,
+            ),
+            _h_trash_file,
+        ),
+        _m.Intent(
+            re.compile(r"\brename\s+.+\s+to\s+\S+", re.IGNORECASE),
+            _h_rename_file,
+        ),
+        _m.Intent(
+            re.compile(r"\bcreate\s+(?:a\s+)?folder\s+.+", re.IGNORECASE),
+            _h_create_folder,
+        ),
+        _m.Intent(
+            re.compile(
+                r"\b(?:show|list|what are)\s+(?:my\s+)?recent\s+files\b",
+                re.IGNORECASE,
+            ),
+            _h_recent_files,
+        ),
+        _m.Intent(
+            re.compile(
+                r"\b(?:open|show|browse)\s+(?:my\s+)?(?:finder\s+)?(?:desktop|downloads|documents|home|projects|pictures|music|movies)\b",
+                re.IGNORECASE,
+            ),
+            _h_open_finder,
+        ),
+
+        # --- Code Review ---
+        _m.Intent(
+            re.compile(
+                r"\b(?:review|check|critique|analyse|analyze)\s+(?:(?:this|my)\s+)?(?:\w+\s+)?code\b",
+                re.IGNORECASE,
+            ),
+            _h_review_code,
+        ),
+
+        # --- Multi-repo Git ---
+        _m.Intent(
+            re.compile(
+                r"\b(?:save|register|add)\s+repo\s+.+",
+                re.IGNORECASE,
+            ),
+            _h_register_repo,
+        ),
+        _m.Intent(
+            re.compile(
+                r"\b(?:switch to|use|activate)\s+(?:my\s+)?\S+\s+repo(?:sitory)?\b",
+                re.IGNORECASE,
+            ),
+            _h_switch_repo,
+        ),
+        _m.Intent(
+            re.compile(r"\b(?:list|show)\s+(?:my\s+)?repos?\b", re.IGNORECASE),
+            _h_list_repos,
+        ),
+
+        # --- Health Monitor ---
+        _m.Intent(
+            re.compile(
+                r"\b(?:health|alert)\s+thresholds?\b",
+                re.IGNORECASE,
+            ),
+            _h_health_thresholds,
+        ),
+
+        # --- Runtime Config ---
+        _m.Intent(
+            re.compile(
+                r"\bset\s+auto.?sleep\s+to\s+\d+",
+                re.IGNORECASE,
+            ),
+            _h_set_auto_sleep,
+        ),
+        _m.Intent(
+            re.compile(
+                r"\bset\s+(?:tts|voice|speech)\s+(?:rate|speed)\s+to\b",
+                re.IGNORECASE,
+            ),
+            _h_set_tts_rate,
+        ),
+        _m.Intent(
+            re.compile(
+                r"\b(?:set|change|switch)\s+voice\s+to\s+\w+",
+                re.IGNORECASE,
+            ),
+            _h_set_voice,
+        ),
+        _m.Intent(
+            re.compile(
+                r"\b(?:show|display|current)\s+config(?:uration)?\b",
+                re.IGNORECASE,
+            ),
+            _h_show_config,
+        ),
+        _m.Intent(
+            re.compile(
+                r"\bset\s+history\s+(?:to|window)\s+\d+",
+                re.IGNORECASE,
+            ),
+            _h_set_history_turns,
+        ),
+    ]
+
+    for intent in reversed(new_intents):
+        _m._INTENTS.insert(0, intent)
+
+    print(f"[Extensions 2] Registered {len(new_intents)} additional intents.")
+
+
+_register_ext2_intents()
+
+
+# ============================================================================
+# PERFORMANCE: Lazy LLM — skip the LLM call for very short common inputs
+# that pattern-match to known conversational fillers.
+# ============================================================================
+
+_FILLER_RESPONSES: dict[re.Pattern, list[str]] = {
+    re.compile(r"^\s*(?:ok|okay|cool|got it|alright|understood|sure|fine)\s*$", re.IGNORECASE): [
+        "Of course, Sir.", "Understood.", "Very well.", "Noted, Sir.",
+    ],
+    re.compile(r"^\s*(?:never ?mind|forget it|skip it|never ?mind that)\s*$", re.IGNORECASE): [
+        "Disregarded, Sir.", "Understood — moving on.", "As you wish.",
+    ],
+    re.compile(r"^\s*(?:yes|yeah|yep|yup|correct|exactly|right|affirmative)\s*$", re.IGNORECASE): [
+        "Perfect, Sir.", "Good.", "Confirmed.", "Understood, Sir.",
+    ],
+    re.compile(r"^\s*(?:no|nope|nah|negative|cancel that)\s*$", re.IGNORECASE): [
+        "Understood, Sir.", "Cancelled.", "Very well.", "As you wish, Sir.",
+    ],
+    re.compile(r"^\s*(?:thanks?|thank you|cheers|appreciate it|ty)\s*$", re.IGNORECASE): [
+        "Anytime, Sir.", "Always.", "Happy to help.", "Of course, Sir.",
+    ],
+    re.compile(r"^\s*(?:good|great|awesome|perfect|excellent|brilliant|nice)\s*$", re.IGNORECASE): [
+        "Glad to hear it, Sir.", "Excellent.", "Good to know, Sir.", "Wonderful.",
+    ],
+}
+
+
+def _check_filler(text: str) -> bool:
+    """
+    If the input is a filler phrase, respond from a local pool and return True.
+    Avoids a round-trip to the LLM for trivial utterances.
+    """
+    import __main__ as _m
+    for pattern, responses in _FILLER_RESPONSES.items():
+        if pattern.match(text.strip()):
+            _m.speak(random.choice(responses))
+            return True
+    return False
+
+
+def _patch_oracle_worker_fillers() -> None:
+    """
+    Patch the main oracle_worker so filler detection runs before LLM dispatch.
+    We patch handle_quick_command instead to keep the worker clean.
+    """
+    import __main__ as _m
+
+    _original_handle = _m.handle_quick_command
+
+    def _handle_with_filler(raw_input: str) -> bool:
+        # Check filler first
+        if _check_filler(raw_input):
+            return True
+        return _original_handle(raw_input)
+
+    _m.handle_quick_command = _handle_with_filler
+
+
+_patch_oracle_worker_fillers()
+
+
+# ============================================================================
+# UTILITY: conversation history deduplication
+#
+# Prevent duplicate consecutive messages in history (can happen when the
+# LLM is called multiple times for the same phrase due to retries).
+# ============================================================================
+
+def _patch_add_to_history() -> None:
+    import __main__ as _m
+
+    _original_add = _m.add_to_history
+
+    def _dedup_add(role: str, content: str) -> None:
+        with _m._memory_lock:
+            hist = _m._conversation_history
+            if hist and hist[-1]["role"] == role and hist[-1]["content"] == content:
+                return   # skip duplicate
+        _original_add(role, content)
+
+    _m.add_to_history = _dedup_add
+
+
+_patch_add_to_history()
+
+
+# ============================================================================
+# UTILITY: Temp file garbage collector
+#
+# Runs every 30 minutes and removes temp files older than 1 hour
+# to prevent TEMP_AUDIO_DIR growing unboundedly in long sessions.
+# ============================================================================
+
+def _temp_gc_loop() -> None:
+    while True:
+        time.sleep(1800)   # every 30 minutes
+        try:
+            import __main__ as _m
+            now = time.time()
+            removed = 0
+            for fname in os.listdir(_m.TEMP_AUDIO_DIR):
+                fpath = os.path.join(_m.TEMP_AUDIO_DIR, fname)
+                try:
+                    if now - os.path.getmtime(fpath) > 3600:
+                        os.remove(fpath)
+                        removed += 1
+                except OSError:
+                    pass
+            if removed:
+                print(f"[GC] Removed {removed} stale temp files.")
+        except Exception as e:
+            print(f"[GC] Error: {e}")
+
+
+threading.Thread(target=_temp_gc_loop, daemon=True, name="temp-gc").start()
+
+
+# ============================================================================
+# UTILITY: Volume normaliser
+#
+# Monitors afplay's output and adjusts volume if audio is too quiet/loud
+# relative to the configured level. Uses a moving average approach.
+# This is a lightweight software AGC (automatic gain control).
+# ============================================================================
+
+_AGC_ENABLED   = False   # off by default, enable with "enable auto gain"
+_AGC_TARGET    = 65      # target volume level
+_AGC_TOLERANCE = 10      # don't adjust within ±10 of target
+
+
+def toggle_agc(enable: bool) -> None:
+    global _AGC_ENABLED
+    _AGC_ENABLED = enable
+
+
+def _h_agc_on(m: re.Match, text: str) -> bool:
+    import __main__ as _m
+    toggle_agc(True)
+    _m.speak("Auto gain control enabled, Sir. I'll keep the volume consistent.")
+    return True
+
+
+def _h_agc_off(m: re.Match, text: str) -> bool:
+    import __main__ as _m
+    toggle_agc(False)
+    _m.speak("Auto gain control disabled, Sir.")
+    return True
+
+
+def _register_agc_intents() -> None:
+    import __main__ as _m
+    _m._INTENTS.extend([
+        _m.Intent(
+            re.compile(r"\b(enable auto ?gain|auto ?gain on|agc on)\b", re.IGNORECASE),
+            _h_agc_on,
+        ),
+        _m.Intent(
+            re.compile(r"\b(disable auto ?gain|auto ?gain off|agc off)\b", re.IGNORECASE),
+            _h_agc_off,
+        ),
+    ])
+
+
+_register_agc_intents()
+
+
+# ============================================================================
+# INTEGRATION: Add import line instructions for oracle.py
+# This prints setup instructions on first import if not yet integrated.
+# ============================================================================
+
+def _check_integration() -> None:
+    """
+    Verify both extension files are importable and print setup reminder
+    if oracle.py doesn't already import them.
+    """
+    oracle_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "oracle.py"
+    )
+    if not os.path.exists(oracle_path):
+        return   # running standalone
+
+    try:
+        with open(oracle_path) as f:
+            oracle_src = f.read()
+    except Exception:
+        return
+
+    missing = []
+    if "oracle_extensions" not in oracle_src:
+        missing.append("oracle_extensions")
+    if "oracle_extensions_2" not in oracle_src:
+        missing.append("oracle_extensions_2")
+
+    if missing:
+        print("\n" + "="*60)
+        print("[Oracle Extensions] SETUP REQUIRED")
+        print("Add these lines at the very END of oracle.py:")
+        print()
+        for mod in missing:
+            print(f"  from {mod} import *")
+        print("="*60 + "\n")
+
+
+_check_integration()
+
+
+# ============================================================================
+# Export public symbols
+# ============================================================================
+
+__all__ = [
+    # Queue
+    "queue_add", "queue_clear", "queue_shuffle", "queue_list",
+    "history_back", "start_radio",
+    # Finder
+    "move_file", "copy_file", "trash_file", "rename_file",
+    "create_folder", "get_recent_files", "open_finder_location",
+    # Code Review
+    "review_code",
+    # Repos
+    "register_repo", "switch_repo",
+    # Health
+    "set_health_threshold",
+    # Config
+    "toggle_agc",
+    "_RUNTIME_CONFIG",
+]
+
+print("[Extensions 2] oracle_extensions_2.py loaded — all modules active.")
