@@ -2,7 +2,7 @@
 
 A local voice assistant for macOS. Say **"Oracle"** or **"Jarvis"** to activate it.
 
-Built by [Rutul Gajjar](https://github.com/rutulgajjar). Open source and open to contributions — if you want to add a feature, fix a bug, or extend it in any direction, pull requests are welcome.
+ Open source and open to contributions — if you want to add a feature, fix a bug, or extend it in any direction, pull requests are welcome.
 
 ---
 
@@ -138,12 +138,6 @@ To contribute:
 4. Open a pull request with a clear description of what you added
 
 Please keep the code style consistent — plain comments, no AI-banner decorations, functions that do one thing.
-
----
-
-## License
-
-MIT — do whatever you want with it, just keep the credit.
 
 ---
 
