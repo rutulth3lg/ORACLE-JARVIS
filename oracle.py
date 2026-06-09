@@ -1,21 +1,3 @@
-# oracle.py
-#
-# Oracle — personal voice assistant for macOS
-# Built by Rutul Gajjar
-#
-# Say "Oracle" or "Jarvis" to wake it up.
-# Stays alive until you say "shutdown" or it auto-sleeps after inactivity.
-#
-# Requirements:
-#   pip install groq edge-tts SpeechRecognition pyaudio yt-dlp psutil requests
-#   brew install portaudio ffmpeg
-#
-# To run:
-#   python oracle.py
-#
-# To install as a login service (starts automatically at boot):
-#   python oracle.py --install
-
 import os
 import sys
 import time
