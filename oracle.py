@@ -1,5 +1,4 @@
-//Created by Rutul Gajjar
-
+//
 import os
 import sys
 import time
