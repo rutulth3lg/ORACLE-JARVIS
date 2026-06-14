@@ -1,4 +1,4 @@
-### Oracle
+## Oracle
 
 A local voice assistant for macOS. Say **"Oracle"** or **"Jarvis"** to activate it.
 
