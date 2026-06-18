@@ -4,7 +4,7 @@ A local voice assistant for macOS. Say **"Oracle"** to activate it.
 
  Open source and open to contributions — if you want to add a feature, fix a bug, or extend it in any direction, pull requests are welcome.
 
----
+----
 
 ## What it does
 
