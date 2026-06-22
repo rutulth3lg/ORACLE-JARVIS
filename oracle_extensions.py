@@ -32,35 +32,13 @@ import random
 from typing import Optional
 from dataclasses import dataclass, field
 
-# ---------------------------------------------------------------------------
-# Guard: this file expects oracle.py symbols in the same process namespace.
-# When imported correctly (from oracle.py via `from oracle_extensions import *`)
-# all oracle globals are already present. We reference them by name at
-# call-time rather than import-time to avoid circular import headaches.
-# ---------------------------------------------------------------------------
-
 def _oracle(name: str):
     """Fetch a symbol from oracle.py's module (the __main__ module)."""
     import __main__
     return getattr(__main__, name)
 
 
-# ============================================================================
-# MODULE 1 — Song Player
-#
-# Replaces the old open_youtube() path for music commands.
-# Uses yt-dlp to find the best audio URL from YouTube, then streams it
-# directly through ffmpeg → afplay pipeline without downloading the full file.
-# Falls back to a temp-file download if streaming fails.
-#
-# Commands handled:
-#   "play <song>"
-#   "play <song> by <artist>"
-#   "next song" / "skip"
-#   "pause music" / "resume music"
-#   "what's playing"
-#   "replay" / "play again"
-# ============================================================================
+#-------
 
 @dataclass
 class _TrackInfo:
