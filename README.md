@@ -23,6 +23,7 @@ A local voice assistant for macOS. Say **"Oracle"** to activate it.
 
 ```bash
 pip install groq edge-tts SpeechRecognition pyaudio yt-dlp
+pip install pynput          # optional — enables the Cmd+Shift+Space hotkey
 brew install portaudio ffmpeg
 ```
 
@@ -34,8 +35,8 @@ Get a free Groq API key at [console.groq.com](https://console.groq.com).
 
 1. Clone the repo:
    ```bash
-   git clone https://github.com/yourusername/oracle-assistant.git
-   cd oracle-assistant
+   git clone https://github.com/rutulth3lg/oracle-jarvis.git
+   cd oracle-jarvis
    ```
 
 2. Install dependencies (see above).
@@ -90,6 +91,24 @@ Say **"Oracle"** or **"Jarvis"**, wait for **"Sir?"**, then speak your command.
 | "Start my workspace" | Opens VS Code + Claude, plays Paranoid |
 | "Who are you" | Oracle introduces itself |
 | "Shut down Oracle" | Exits cleanly |
+
+### Power commands
+
+These run entirely on-device — no LLM round trip.
+
+| Command | What happens |
+|---|---|
+| "Git status" / "Git push" / "Git log" | Runs git in your current project, hands-free |
+| "Git commit fixed the parser" | Stages everything and commits with that message |
+| "Set git repo to ~/code/myapp" | Points Oracle at a specific repository |
+| "Read this to me" | Reads the clipboard aloud in chunks |
+| "Stop reading" | Interrupts a read-aloud immediately |
+| "Export session" | Saves the conversation to a dated markdown file on the Desktop |
+| "Start focus mode" | Blocks distracting sites for a work block |
+| "Start a pomodoro" | Runs a 25/5 pomodoro cycle with voice cues |
+| "Every morning at 8 remind me to check email" | Sets a recurring daily reminder |
+| "Do X then Y then Z" | Chains several commands in one breath |
+| "When I say launch, open VS Code" | Creates a custom voice alias |
 
 ---
 

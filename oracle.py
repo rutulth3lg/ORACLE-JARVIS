@@ -1,4 +1,13 @@
-//
+# oracle.py
+#
+# Oracle — a local voice assistant for macOS.
+# Say "Oracle" or "Jarvis" to wake it, wait for the reply, then speak.
+# Everything lives in this one file: wake word, speech-to-text, the LLM
+# brain, text-to-speech, the HUD overlay, and all the voice commands.
+#
+# Run it with:   python oracle.py
+# Install at login:   python oracle.py --install
+
 import os
 import sys
 import time
@@ -211,9 +220,9 @@ class OracleHUD:
         return "#{:02x}{:02x}{:02x}".format(r // 2, g // 2, b // 2)
 
 
- ---------------------------------------------------------------------------
- Persistent memory
----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Persistent memory
+# ---------------------------------------------------------------------------
 
 _conversation_history: list[dict] = []
 _named_facts:          dict       = {}
@@ -1303,7 +1312,11 @@ def _h_date(m: re.Match, text: str) -> bool:
 
 
 def _h_timer(m: re.Match, text: str) -> bool:
-    n, unit = int(m.group(1)), m.group(2)
+    dm = re.search(r"(\d+)\s*(second|minute|hour|sec|min|hr)", text, re.IGNORECASE)
+    if not dm:
+        speak("How long should I set the timer for, Sir?")
+        return True
+    n, unit = int(dm.group(1)), dm.group(2)
     set_timer(_parse_duration(n, unit), _human_duration(n, unit))
     speak(f"Timer set for {_human_duration(n, unit)}, Sir.")
     return True
@@ -1531,8 +1544,11 @@ _INTENTS: list[Intent] = [
            _h_wifi),
     Intent(re.compile(r"\b(what.*time|current time|time is it|the time)\b"), _h_time),
     Intent(re.compile(r"\b(what.*date|today.*date|what day|the date)\b"), _h_date),
+    # Fire on a timer request in either word order — "timer for 10 minutes"
+    # and "10 minute timer" both count. Needs a number so "cancel the timer"
+    # falls through to the cancel handler below.
     Intent(re.compile(
-        r"(?:set|start|create)?\s*(?:a\s+)?timer\s+(?:for\s+)?(\d+)\s*(second|minute|hour|sec|min|hr)"),
+        r"(?:\btimer\b.*\d)|(?:\d.*\btimer\b)"),
            _h_timer),
     Intent(re.compile(r"\bcancel\s+(?:the\s+)?(?:timer|alarm)\b"),
            _h_cancel_timer),
@@ -1572,7 +1588,7 @@ _INTENTS: list[Intent] = [
         r"(?:calculate|compute|what(?:'s|\s+is)\s+)(?:the\s+)?(?:result\s+of\s+)?"
         r"(-?[\d\s\+\-\*\/\(\)\.\^%]+)"),
            _h_calculate),
-    Intent(re.compile(r"\b(status report|system status|full status|how are you doing|diagnostics)\b"),
+    Intent(re.compile(r"\b(status report|system status|full status|how are you doing)\b"),
            _h_status_report),
     Intent(re.compile(r"\b(clear history|forget.*conversation|reset.*memory|wipe.*history)\b"),
            _h_clear_history),
@@ -1964,51 +1980,8 @@ _DIDNT_CATCH: list[str] = [
 ]
 
 
-def oracle_worker() -> None:
-    global _last_activity_time, _interaction_count
-
-    while True:
-        try:
-            _wake_event_queue.get(timeout=0.5)
-        except queue.Empty:
-            continue
-
-        # Drain duplicate wake events
-        while not _wake_event_queue.empty():
-            try:
-                _wake_event_queue.get_nowait()
-            except queue.Empty:
-                break
-
-        _last_activity_time = time.time()
-        _interaction_count += 1
-
-        force_stop_tts()
-        set_hud("waking")
-        speak_blocking(random.choice(_WAKE_RESPONSES))
-
-        user_input = listen_for_command()
-
-        if not user_input:
-            speak(random.choice(_DIDNT_CATCH))
-            set_hud("standby")
-            continue
-
-        # Strip the wake word itself from the command if Whisper captured it
-        cleaned_input = re.sub(r"^\s*(?:oracle|jarvis)[,.]?\s*", "", user_input,
-                               flags=re.IGNORECASE).strip() or user_input
-
-        print(f"\nYou: {cleaned_input}\n")
-        _log("you", cleaned_input)
-
-        # Fast local path → LLM fallback
-        if not handle_quick_command(cleaned_input):
-            stop_tts_flag.clear()
-            get_llm_response(cleaned_input)
-
-        _tts_queue.join()
-        _is_speaking.clear()
-        set_hud("standby")
+# The wake loop itself (oracle_worker) is defined further down, once the
+# contextual greeting and alias support it relies on have been declared.
 
 
 # ---------------------------------------------------------------------------
@@ -2112,35 +2085,9 @@ def _pick_boot_line() -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-
-    if "--install" in sys.argv:
-        install_as_login_service()
-        sys.exit(0)
-
-    _cleanup_temp_dir()
-    load_memory()
-
-    threading.Thread(target=_run_tts_event_loop,  name="tts-worker",    daemon=True).start()
-    threading.Thread(target=wake_capture_thread,  name="wake-capture",  daemon=True).start()
-    threading.Thread(target=transcription_thread, name="transcriber",   daemon=True).start()
-    threading.Thread(target=auto_sleep_thread,    name="auto-sleep",    daemon=True).start()
-    threading.Thread(target=oracle_worker,        name="oracle-worker", daemon=True).start()
-
-    _root = tk.Tk()
-    _root.title("Oracle")
-    _hud  = OracleHUD(_root)
-
-    def _boot():
-        time.sleep(0.4)
-        speak_blocking(_pick_boot_line())
-        set_hud("standby")
-        print(f"\nOracle is online. Say 'Oracle' or 'Jarvis' to activate.")
-        print(f"Auto-sleep: {AUTO_SLEEP_MINUTES} minutes of inactivity.\n")
-
-    threading.Thread(target=_boot, name="boot", daemon=True).start()
-
-    _root.mainloop()
+# NOTE: the real entry point lives at the very bottom of this file. Everything
+# below here defines more commands and registers them on _INTENTS, so the app
+# has to start *after* all of that has loaded — not here in the middle.
 
 
 # =============================================================================
@@ -2926,111 +2873,6 @@ def _maybe_deliver_briefing() -> None:
         deliver_morning_briefing()
 
 
-# ---------------------------------------------------------------------------
-# Patch oracle_worker to include briefing + hotkey listener at startup
-#
-# We re-define oracle_worker here so the extended features (briefing,
-# contextual greetings, cleaned input) are incorporated. The previous
-# definition in the main body serves as documentation; this one runs.
-# ---------------------------------------------------------------------------
-
-def oracle_worker() -> None:  # noqa: F811  (intentional re-definition)
-    global _last_activity_time, _interaction_count
-
-    while True:
-        try:
-            _wake_event_queue.get(timeout=0.5)
-        except queue.Empty:
-            continue
-
-        # Drain duplicate wake events
-        while not _wake_event_queue.empty():
-            try:
-                _wake_event_queue.get_nowait()
-            except queue.Empty:
-                break
-
-        _last_activity_time = time.time()
-        _interaction_count += 1
-
-        force_stop_tts()
-        set_hud("waking")
-
-        # Proactive morning briefing — fires silently before the prompt
-        _maybe_deliver_briefing()
-
-        # Contextual wake response instead of always "Sir?"
-        speak_blocking(contextual_greeting())
-
-        user_input = listen_for_command()
-
-        if not user_input:
-            speak(random.choice(_DIDNT_CATCH))
-            set_hud("standby")
-            continue
-
-        # Strip the wake word if Whisper transcribed it
-        cleaned_input = re.sub(
-            r"^\s*(?:oracle|jarvis)[,.]?\s*", "", user_input, flags=re.IGNORECASE
-        ).strip() or user_input
-
-        print(f"\nYou: {cleaned_input}\n")
-        _log("you", cleaned_input)
-
-        if not handle_quick_command(cleaned_input):
-            stop_tts_flag.clear()
-            get_llm_response(cleaned_input)
-
-        _tts_queue.join()
-        _is_speaking.clear()
-        set_hud("standby")
-
-
-# ---------------------------------------------------------------------------
-# Entry point patch — start hotkey listener alongside other threads
-# ---------------------------------------------------------------------------
-# The if __name__ == "__main__" block already ran above with the earlier
-# definition. To add the hotkey listener we inject it into a startup
-# function that the block already calls via threading — specifically we
-# add it to the boot thread so it starts after tkinter is initialised.
-#
-# NOTE: Because this file is run as __main__, the second if __name__ block
-# below replaces the first. Python executes top-to-bottom; only the last
-# definition wins for the __main__ guard.
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-
-    if "--install" in sys.argv:
-        install_as_login_service()
-        sys.exit(0)
-
-    _cleanup_temp_dir()
-    load_memory()
-
-    threading.Thread(target=_run_tts_event_loop,  name="tts-worker",    daemon=True).start()
-    threading.Thread(target=wake_capture_thread,  name="wake-capture",  daemon=True).start()
-    threading.Thread(target=transcription_thread, name="transcriber",   daemon=True).start()
-    threading.Thread(target=auto_sleep_thread,    name="auto-sleep",    daemon=True).start()
-    threading.Thread(target=oracle_worker,        name="oracle-worker", daemon=True).start()
-
-    _root = tk.Tk()
-    _root.title("Oracle")
-    _hud  = OracleHUD(_root)
-
-    def _boot():
-        time.sleep(0.4)
-        speak_blocking(_pick_boot_line())
-        set_hud("standby")
-        _start_hotkey_listener()
-        print(f"\nOracle is online. Say 'Oracle' or 'Jarvis' to activate.")
-        print(f"Keyboard shortcut: Cmd+Shift+Space")
-        print(f"Auto-sleep: {AUTO_SLEEP_MINUTES} minutes of inactivity.\n")
-
-    threading.Thread(target=_boot, name="boot", daemon=True).start()
-    _root.mainloop()
-
-
 # =============================================================================
 # MODULE: Smart Context Engine
 # Tracks what the user is working on and enriches LLM prompts automatically.
@@ -3223,11 +3065,9 @@ _INTENTS.extend([
 ])
 
 
-# Patch oracle_worker to resolve aliases before dispatch
-_raw_oracle_worker = oracle_worker
-
-
-def oracle_worker() -> None:  # noqa: F811
+# The main wake loop. Waits for a wake event, greets, listens for a command,
+# expands any saved aliases, then runs it locally or hands it to the LLM.
+def oracle_worker() -> None:
     global _last_activity_time, _interaction_count
 
     while True:
@@ -3756,7 +3596,7 @@ def _h_clipboard_history(m: re.Match, text: str) -> bool:
     return True
 
 
-threading.Thread(target=_clipboard_poll_worker, name="clipboard-poll", daemon=True).start()
+# (the clipboard-poll worker is started from main() alongside the other threads)
 
 _INTENTS.append(
     Intent(re.compile(r"\b(clipboard history|previous clipboard|last clipboard|clipboard.*ago)\b"),
@@ -4400,6 +4240,471 @@ _INTENTS.append(
 
 
 # =============================================================================
+# MODULE: Read-aloud
+# "Read this to me" reads whatever is on the clipboard out loud, in chunks,
+# so long articles don't come out as one giant breath. "Stop reading" cuts it.
+# =============================================================================
+
+_READ_CHUNK_CHARS = 300
+
+
+def _chunk_text(text: str, chunk_size: int = _READ_CHUNK_CHARS) -> list[str]:
+    """Split text into speakable chunks at sentence boundaries where possible."""
+    sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z"\(])', text)
+    chunks: list[str] = []
+    current = ""
+    for sentence in sentences:
+        if len(current) + len(sentence) + 1 <= chunk_size:
+            current = (current + " " + sentence).strip()
+        else:
+            if current:
+                chunks.append(current)
+            # A single sentence longer than a chunk gets split on words.
+            if len(sentence) > chunk_size:
+                acc = ""
+                for word in sentence.split():
+                    if len(acc) + len(word) + 1 <= chunk_size:
+                        acc = (acc + " " + word).strip()
+                    else:
+                        if acc:
+                            chunks.append(acc)
+                        acc = word
+                current = acc
+            else:
+                current = sentence
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def read_clipboard_aloud(max_chars: int = 8000) -> None:
+    """Read the clipboard aloud, stopping early if 'stop reading' is heard."""
+    content = get_clipboard()
+    if not content or not content.strip():
+        speak("The clipboard is empty, Sir.")
+        return
+
+    # Clear any leftover stop flag from a previous read, or we'd stop instantly.
+    stop_tts_flag.clear()
+
+    content = content.strip()[:max_chars]
+    word_count = len(content.split())
+
+    if word_count < 5:
+        speak(f"Clipboard: {content}")
+        return
+
+    speak(f"Reading {word_count} words from your clipboard, Sir. Say 'stop reading' to interrupt.")
+
+    for chunk in _chunk_text(content):
+        if stop_tts_flag.is_set():
+            break
+        clean = sanitize_for_speech(chunk)
+        if clean:
+            speak(clean)
+
+    if not stop_tts_flag.is_set():
+        speak("Done reading, Sir.")
+
+
+def _h_read_clipboard_aloud(m: re.Match, text: str) -> bool:
+    threading.Thread(target=read_clipboard_aloud, name="read-aloud", daemon=True).start()
+    return True
+
+
+def _h_stop_reading(m: re.Match, text: str) -> bool:
+    force_stop_tts()
+    speak("Stopped reading, Sir.")
+    return True
+
+
+# "stop reading" goes to the front so it beats the generic stop-media handler.
+_INTENTS.insert(0, Intent(
+    re.compile(r"\b(stop reading|stop narrating|stop reading aloud)\b", re.IGNORECASE),
+    _h_stop_reading,
+))
+_INTENTS.append(Intent(
+    re.compile(
+        r"\b(read this to me|read it (?:aloud|out|back)|"
+        r"read (?:the )?clipboard (?:aloud|to me|out)|"
+        r"read (?:this )?(?:text|article|page) (?:aloud|to me|out)|"
+        r"read it out loud)\b",
+        re.IGNORECASE,
+    ),
+    _h_read_clipboard_aloud,
+))
+
+
+# =============================================================================
+# MODULE: Conversation export
+# "Export session" dumps the current session — facts, transcript, and the full
+# conversation history — to a dated markdown file on the Desktop.
+# =============================================================================
+
+def export_session_to_markdown() -> Optional[str]:
+    """Write the session to ~/Desktop/oracle_session_<date>.md. Returns the path."""
+    with _session_lock:
+        entries = list(_session_log)
+    with _memory_lock:
+        history = list(_conversation_history)
+        facts   = dict(_named_facts)
+
+    now  = datetime.datetime.now()
+    path = os.path.expanduser(now.strftime("~/Desktop/oracle_session_%Y-%m-%d_%H-%M.md"))
+
+    lines = [
+        "# Oracle Session Export",
+        "",
+        f"**Date:** {now.strftime('%A, %B %-d, %Y')}  ",
+        f"**Time:** {now.strftime('%-I:%M %p')}  ",
+        f"**Interactions:** {_interaction_count}  ",
+        "",
+    ]
+
+    if facts:
+        lines += ["## Stored Facts", ""]
+        for k, v in facts.items():
+            if k.startswith("__"):
+                continue
+            lines.append(f"- **{k.replace('_', ' ').title()}:** {v}")
+        lines.append("")
+
+    lines += ["## Session Transcript", ""]
+    if entries:
+        for e in entries:
+            if e.speaker == "you":
+                lines.append(f"**[{e.ts}] You:** {e.text}")
+            elif e.speaker == "oracle":
+                lines.append(f"**[{e.ts}] Oracle:** {e.text}")
+            else:
+                lines.append(f"*[{e.ts}] System: {e.text}*")
+            lines.append("")
+    else:
+        lines += ["*No interactions recorded.*", ""]
+
+    if history:
+        lines += ["---", "", "## Full Conversation History", ""]
+        for msg in history:
+            role = "**You**" if msg["role"] == "user" else "**Oracle**"
+            lines += [f"{role}: {msg['content']}", ""]
+
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        return path
+    except Exception as e:
+        print(f"[Export] Write failed: {e}")
+        return None
+
+
+def _h_export_session(m: re.Match, text: str) -> bool:
+    path = export_session_to_markdown()
+    if path:
+        speak(f"Session exported to {os.path.basename(path)} on your Desktop, Sir.")
+    else:
+        speak("Export failed — check permissions on your Desktop, Sir.")
+    return True
+
+
+_INTENTS.append(Intent(
+    re.compile(
+        r"\b(export session|save session|export conversation|save chat|"
+        r"save this conversation|export transcript)\b",
+        re.IGNORECASE,
+    ),
+    _h_export_session,
+))
+
+
+# =============================================================================
+# MODULE: Git by voice
+# Runs git in the current project so you can drive it hands-free: "git status",
+# "git commit fixed the parser", "git push", and so on. The repo is
+# auto-detected from ~/Projects (or set explicitly with "set git repo to ...").
+# =============================================================================
+
+_GIT_REPO_PATH: Optional[str] = None
+_GIT_REPO_LOCK = threading.Lock()
+
+
+def _find_git_repo(start_path: Optional[str] = None) -> Optional[str]:
+    """Walk up from start_path (or ~/Projects) to the nearest .git directory."""
+    search = start_path or os.path.expanduser("~/Projects")
+    if not os.path.isdir(search):
+        search = os.path.expanduser("~")
+
+    path = search
+    for _ in range(8):   # walk at most 8 levels up
+        if os.path.isdir(os.path.join(path, ".git")):
+            return path
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+
+    # Fallback: scan ~/Projects and ~/Desktop for the first repo we find.
+    for root_dir in (os.path.expanduser("~/Projects"), os.path.expanduser("~/Desktop")):
+        if not os.path.isdir(root_dir):
+            continue
+        try:
+            for entry in os.scandir(root_dir):
+                if entry.is_dir() and os.path.isdir(os.path.join(entry.path, ".git")):
+                    return entry.path
+        except PermissionError:
+            continue
+    return None
+
+
+def _get_git_repo() -> Optional[str]:
+    """Return the active repo path, auto-detecting and caching it once."""
+    global _GIT_REPO_PATH
+    with _GIT_REPO_LOCK:
+        if _GIT_REPO_PATH and os.path.isdir(_GIT_REPO_PATH):
+            return _GIT_REPO_PATH
+        _GIT_REPO_PATH = _find_git_repo()
+        return _GIT_REPO_PATH
+
+
+def _git_run(args: list[str], repo: str, timeout: int = 15) -> tuple[int, str, str]:
+    """Run a git command in repo. Returns (returncode, stdout, stderr)."""
+    try:
+        r = subprocess.run(["git"] + args, cwd=repo,
+                           capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return 1, "", "Command timed out"
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def git_status() -> None:
+    repo = _get_git_repo()
+    if not repo:
+        speak("No git repository found, Sir.")
+        return
+    rc, out, err = _git_run(["status", "--short", "--branch"], repo)
+    if rc != 0:
+        speak(f"Git error: {err[:120]}")
+        return
+
+    branch = ""
+    changes: list[str] = []
+    for line in out.splitlines():
+        if line.startswith("##"):
+            bm = re.search(r"## (\S+?)(?:\.{3}|$)", line)
+            branch = bm.group(1) if bm else line[3:]
+        else:
+            changes.append(line.strip())
+
+    repo_name = os.path.basename(repo)
+    if not changes:
+        speak(f"Repo {repo_name} on branch {branch} — working tree clean, Sir.")
+        return
+
+    modified  = sum(1 for c in changes if c and c[0] == "M")
+    added     = sum(1 for c in changes if c and c[0] == "A")
+    deleted   = sum(1 for c in changes if c and c[0] == "D")
+    untracked = sum(1 for c in changes if c and c[0] == "?")
+
+    parts = []
+    if modified:  parts.append(f"{modified} modified")
+    if added:     parts.append(f"{added} added")
+    if deleted:   parts.append(f"{deleted} deleted")
+    if untracked: parts.append(f"{untracked} untracked")
+    total = modified + added + deleted + untracked
+    speak(f"Repo {repo_name} on branch {branch}. "
+          + ", ".join(parts) + f" file{'s' if total != 1 else ''}, Sir.")
+
+
+def git_diff_summary() -> None:
+    repo = _get_git_repo()
+    if not repo:
+        speak("No git repository found, Sir.")
+        return
+    rc, out, err = _git_run(["diff", "--stat"], repo)
+    if rc != 0:
+        speak(f"Git error: {err[:120]}")
+        return
+    if not out:
+        _, out, _ = _git_run(["diff", "--cached", "--stat"], repo)
+    if not out:
+        speak("No unstaged or staged changes to diff, Sir.")
+        return
+    speak(f"Diff summary: {out.splitlines()[-1]}, Sir.")
+
+
+def git_log(count: int = 5) -> None:
+    repo = _get_git_repo()
+    if not repo:
+        speak("No git repository found, Sir.")
+        return
+    rc, out, err = _git_run(["log", f"-{count}", "--oneline", "--no-decorate"], repo)
+    if rc != 0:
+        speak(f"Git log error: {err[:120]}")
+        return
+    if not out:
+        speak("No commits yet, Sir.")
+        return
+    lines = out.splitlines()
+    speak(f"Last {len(lines)} commit{'s' if len(lines) != 1 else ''}, Sir.")
+    for line in lines:
+        parts = line.split(" ", 1)
+        speak((parts[1].strip() if len(parts) > 1 else line)[:100])
+
+
+def git_commit(message: str) -> None:
+    repo = _get_git_repo()
+    if not repo:
+        speak("No git repository found, Sir.")
+        return
+    _git_run(["add", "-A"], repo)
+    rc, out, err = _git_run(["commit", "-m", message], repo)
+    if rc == 0:
+        speak(f"Committed: {out.splitlines()[0] if out else 'done'}, Sir.")
+    elif "nothing to commit" in (out + err).lower():
+        speak("Nothing to commit — working tree is clean, Sir.")
+    else:
+        speak(f"Commit failed: {(err or out)[:120]}, Sir.")
+
+
+def git_push() -> None:
+    repo = _get_git_repo()
+    if not repo:
+        speak("No git repository found, Sir.")
+        return
+    speak("Pushing to remote, Sir.")
+    rc, out, err = _git_run(["push"], repo, timeout=30)
+    speak("Push successful, Sir." if rc == 0 else f"Push failed: {(err or out)[:160]}, Sir.")
+
+
+def git_pull() -> None:
+    repo = _get_git_repo()
+    if not repo:
+        speak("No git repository found, Sir.")
+        return
+    speak("Pulling from remote, Sir.")
+    rc, out, err = _git_run(["pull"], repo, timeout=30)
+    if rc == 0:
+        speak(f"Pull done — {out.splitlines()[-1] if out else 'up to date'}, Sir.")
+    else:
+        speak(f"Pull failed: {(err or out)[:120]}, Sir.")
+
+
+def git_branch() -> None:
+    repo = _get_git_repo()
+    if not repo:
+        speak("No git repository found, Sir.")
+        return
+    rc, out, err = _git_run(["branch", "--list"], repo)
+    if rc != 0:
+        speak(f"Git error: {err[:120]}")
+        return
+    branches = [b.strip().lstrip("* ") for b in out.splitlines() if b.strip()]
+    current  = next((b.lstrip("* ") for b in out.splitlines() if b.startswith("*")), "")
+    others   = [b for b in branches if b != current]
+    speak(f"Currently on branch {current}. "
+          + (f"Other branches: {', '.join(others)}." if others else "No other local branches.")
+          + " Sir.")
+
+
+def git_stash(pop: bool = False) -> None:
+    repo = _get_git_repo()
+    if not repo:
+        speak("No git repository found, Sir.")
+        return
+    rc, out, err = _git_run(["stash", "pop"] if pop else ["stash"], repo)
+    if rc == 0:
+        speak(f"Stash {'popped' if pop else 'saved'} successfully, Sir.")
+    else:
+        speak(f"Stash error: {(err or out)[:120]}, Sir.")
+
+
+def git_set_repo(path: str) -> None:
+    global _GIT_REPO_PATH
+    with _GIT_REPO_LOCK:
+        _GIT_REPO_PATH = os.path.expanduser(path)
+
+
+def _h_git_status(m: re.Match, text: str) -> bool:
+    threading.Thread(target=git_status, daemon=True).start()
+    return True
+
+
+def _h_git_diff(m: re.Match, text: str) -> bool:
+    threading.Thread(target=git_diff_summary, daemon=True).start()
+    return True
+
+
+def _h_git_log(m: re.Match, text: str) -> bool:
+    cm = re.search(r"(\d+)", text)
+    threading.Thread(target=git_log, args=(int(cm.group(1)) if cm else 5,), daemon=True).start()
+    return True
+
+
+def _h_git_commit(m: re.Match, text: str) -> bool:
+    msg_m = re.search(
+        r"(?:commit)\s+(?:with\s+(?:message\s+)?|message\s+)?['\"]?(.+?)['\"]?\s*$",
+        text, re.IGNORECASE,
+    )
+    if not msg_m:
+        speak("What should the commit message be, Sir?")
+        return True
+    threading.Thread(target=git_commit, args=(msg_m.group(1).strip(),), daemon=True).start()
+    return True
+
+
+def _h_git_push(m: re.Match, text: str) -> bool:
+    threading.Thread(target=git_push, daemon=True).start()
+    return True
+
+
+def _h_git_pull(m: re.Match, text: str) -> bool:
+    threading.Thread(target=git_pull, daemon=True).start()
+    return True
+
+
+def _h_git_branch(m: re.Match, text: str) -> bool:
+    threading.Thread(target=git_branch, daemon=True).start()
+    return True
+
+
+def _h_git_stash(m: re.Match, text: str) -> bool:
+    pop = any(w in text for w in ("pop", "unstash", "restore"))
+    threading.Thread(target=git_stash, args=(pop,), daemon=True).start()
+    return True
+
+
+def _h_git_set_repo(m: re.Match, text: str) -> bool:
+    path_m = re.search(r"(?:set git repo|git repo|set repo)\s+(?:to\s+)?(.+)", text, re.IGNORECASE)
+    if not path_m:
+        speak("Please tell me the repo path, Sir.")
+        return True
+    expanded = os.path.expanduser(path_m.group(1).strip().strip("\"'"))
+    if os.path.isdir(expanded):
+        git_set_repo(expanded)
+        speak(f"Git repo set to {os.path.basename(expanded)}, Sir.")
+    else:
+        speak("That path doesn't exist, Sir.")
+    return True
+
+
+_INTENTS.extend([
+    Intent(re.compile(r"\bgit\s+status\b", re.IGNORECASE),          _h_git_status),
+    Intent(re.compile(r"\bgit\s+diff\b", re.IGNORECASE),            _h_git_diff),
+    Intent(re.compile(r"\bgit\s+log\b", re.IGNORECASE),             _h_git_log),
+    Intent(re.compile(r"\b(?:set\s+git\s+repo|git\s+repo|set\s+repo)\b", re.IGNORECASE),
+           _h_git_set_repo),
+    Intent(re.compile(r"\b(?:git\s+)?commit\s+(?:with\s+)?(?:message\s+)?\S+", re.IGNORECASE),
+           _h_git_commit),
+    Intent(re.compile(r"\bgit\s+push\b", re.IGNORECASE),            _h_git_push),
+    Intent(re.compile(r"\bgit\s+pull\b", re.IGNORECASE),            _h_git_pull),
+    Intent(re.compile(r"\bgit\s+branch\b", re.IGNORECASE),          _h_git_branch),
+    Intent(re.compile(r"\bgit\s+(?:stash|unstash|pop\s+stash|stash\s+pop)\b", re.IGNORECASE),
+           _h_git_stash),
+])
+
+
+# =============================================================================
 # MODULE: Startup self-test (runs once, silently, at boot)
 # Verifies all critical subsystems and logs result; does NOT speak unless
 # a critical failure is detected (avoids noise at startup).
@@ -4439,9 +4744,58 @@ def _silent_self_test() -> None:
         print("[Self-test] All systems nominal.")
 
 
-threading.Thread(target=_silent_self_test, name="self-test", daemon=True).start()
+# =============================================================================
+# Entry point
+#
+# This is the ONE place the app actually starts. It lives at the very bottom
+# on purpose: every command above has to be defined and registered on _INTENTS
+# first, otherwise those features would be invisible when the wake loop runs.
+# =============================================================================
+
+def main() -> None:
+    # "python oracle.py --install" just sets up the login item and exits.
+    if "--install" in sys.argv:
+        install_as_login_service()
+        return
+
+    _cleanup_temp_dir()
+    load_memory()
+
+    # Resume any daily schedules saved in a previous session, otherwise they'd
+    # sit dormant until the next time you added or listed one.
+    if any(t.label != _SCHEDULES_KEY for t in _load_schedules()):
+        _ensure_scheduler_running()
+
+    # Background workers. All daemon threads so Ctrl+C / quit kills them too.
+    threading.Thread(target=_run_tts_event_loop,  name="tts-worker",    daemon=True).start()
+    threading.Thread(target=wake_capture_thread,  name="wake-capture",  daemon=True).start()
+    threading.Thread(target=transcription_thread, name="transcriber",   daemon=True).start()
+    threading.Thread(target=auto_sleep_thread,    name="auto-sleep",    daemon=True).start()
+    threading.Thread(target=oracle_worker,        name="oracle-worker", daemon=True).start()
+    threading.Thread(target=_clipboard_poll_worker, name="clipboard-poll", daemon=True).start()
+    threading.Thread(target=_silent_self_test,    name="self-test",     daemon=True).start()
+
+    # The HUD has to live on the main thread — tkinter is not thread-safe.
+    root = tk.Tk()
+    root.title("Oracle")
+    hud = OracleHUD(root)   # noqa: F841  (kept alive by the mainloop)
+
+    def _boot():
+        time.sleep(0.4)
+        speak_blocking(_pick_boot_line())
+        set_hud("standby")
+        _start_hotkey_listener()
+        print("\nOracle is online. Say 'Oracle' or 'Jarvis' to activate.")
+        print("Keyboard shortcut: Cmd+Shift+Space")
+        print(f"Auto-sleep: {AUTO_SLEEP_MINUTES} minutes of inactivity.\n")
+
+    threading.Thread(target=_boot, name="boot", daemon=True).start()
+
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        print("\nOracle shutting down. Goodbye, Sir.")
 
 
-# =============================================================================
-# Final line count marker — everything above this is live production code.
-# =============================================================================
+if __name__ == "__main__":
+    main()
