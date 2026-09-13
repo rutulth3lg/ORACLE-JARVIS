@@ -14,7 +14,7 @@ A local voice assistant for macOS. Say **"Oracle"** to activate it.
 - Sets timers and reminders with voice and macOS notification callbacks
 - Controls system volume, takes screenshots, locks the screen
 - Remembers personal facts you tell it ("remember that my car is a Tesla")
-- Floating status HUD in the corner of your screen (STANDBY / LISTENING / SPEAKING)
+- A glowing orb in the corner of your screen that breathes on standby and pulses brighter while listening, thinking, and speaking (drag it anywhere)
 - Auto-sleeps after a configurable period of inactivity
 
 ---

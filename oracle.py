@@ -13,6 +13,7 @@ import sys
 import time
 import re
 import json
+import math
 import uuid
 import shutil
 import subprocess
@@ -195,14 +196,16 @@ def _log(speaker: str, text: str) -> None:
 
 _hud_queue: queue.Queue = queue.Queue()
 
-HUD_CONFIG = {
-    "standby":    ("● STANDBY",    "#0d0d0d", "#0d0d0d", "#3a3a7a"),
-    "listening":  ("◉ LISTENING",  "#0d0d0d", "#001500", "#00ff41"),
-    "processing": ("⟳ PROCESSING", "#0d0d0d", "#1a0d00", "#ff9500"),
-    "speaking":   ("▶ SPEAKING",   "#0d0d0d", "#00101a", "#0099ff"),
-    "waking":     ("◎ WAKE",       "#0d0d0d", "#1a0010", "#ff0055"),
-    "sleeping":   ("◌ SLEEPING",   "#050505", "#050505", "#222244"),
-    "error":      ("✕ ERROR",      "#0d0d0d", "#1a0000", "#ff3333"),
+# Each state: (label, orb rgb, pulse speed, pulse amplitude 0-1, base glow 0-1).
+# The orb breathes slowly on standby and glows harder/faster while active.
+ORB_STATES = {
+    "standby":    ("STANDBY",    ( 90,  90, 190), 0.07, 0.20, 0.45),
+    "listening":  ("LISTENING",  (  0, 235, 120), 0.22, 0.45, 0.70),
+    "processing": ("THINKING",   (255, 150,  30), 0.30, 0.40, 0.65),
+    "speaking":   ("SPEAKING",   (  0, 170, 255), 0.16, 0.40, 0.70),
+    "waking":     ("YES, SIR",   (255,  40, 120), 0.34, 0.50, 0.75),
+    "sleeping":   ("ASLEEP",     ( 40,  40,  80), 0.03, 0.10, 0.18),
+    "error":      ("ERROR",      (255,  55,  55), 0.40, 0.55, 0.75),
 }
 
 
@@ -211,84 +214,103 @@ def set_hud(state: str) -> None:
 
 
 class OracleHUD:
-    """Frameless always-on-top overlay — all drawing on main thread via after()."""
+    """A small always-on-top glowing orb — Oracle's on-screen presence.
+
+    All drawing happens on the main thread on a ~25fps timer. State changes are
+    handed over from worker threads through _hud_queue.
+    """
+
+    SIZE = 128   # orb canvas is SIZE x SIZE, plus room for a label below
 
     def __init__(self, root: tk.Tk):
-        self.root       = root
-        self._state     = "standby"
-        self._pulse_job = None
+        self.root   = root
+        self._state = "standby"
+        self._phase = 0.0
 
         root.overrideredirect(True)
         root.attributes("-topmost", True)
-        root.attributes("-alpha", 0.92)
-        root.configure(bg="#0d0d0d")
+        root.attributes("-alpha", 0.95)
+        root.configure(bg="#08080c")
+        try:
+            # On macOS this makes the black window background see-through, so
+            # only the orb itself shows. Harmless (ignored) elsewhere.
+            root.wm_attributes("-transparent", True)
+        except Exception:
+            pass
 
-        screen_w = root.winfo_screenwidth()
-        screen_h = root.winfo_screenheight()
-        win_w, win_h = 250, 48
-        root.geometry(f"{win_w}x{win_h}+{screen_w - win_w - 18}+{screen_h - win_h - 60}")
+        w, h = self.SIZE, self.SIZE + 22
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.geometry(f"{w}x{h}+{sw - w - 24}+{sh - h - 64}")
+
+        self.canvas = tk.Canvas(root, width=w, height=h,
+                                bg="#08080c", highlightthickness=0, bd=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        # Let the user drag the orb wherever they like.
+        self.canvas.bind("<Button-1>", self._drag_start)
+        self.canvas.bind("<B1-Motion>", self._drag_move)
 
         try:
-            label_font = tkfont.Font(family="SF Pro Display", size=11, weight="bold")
+            self._font = tkfont.Font(family="SF Pro Display", size=9, weight="bold")
         except Exception:
-            label_font = tkfont.Font(family="Helvetica Neue", size=11, weight="bold")
+            self._font = tkfont.Font(family="Helvetica", size=9, weight="bold")
 
-        self.frame = tk.Frame(
-            root, bg="#0d0d0d",
-            highlightbackground="#333366", highlightthickness=1,
-        )
-        self.frame.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        self.root.after(40, self._tick)
 
-        self.label = tk.Label(
-            self.frame, text="● STANDBY",
-            font=label_font, fg="#3a3a7a", bg="#0d0d0d",
-            padx=14, pady=12,
-        )
-        self.label.pack(side=tk.LEFT)
+    # --- dragging ---------------------------------------------------------
+    def _drag_start(self, e):
+        self._dx, self._dy = e.x, e.y
 
-        self.root.after(60, self._poll)
+    def _drag_move(self, e):
+        self.root.geometry(f"+{self.root.winfo_x() + e.x - self._dx}"
+                           f"+{self.root.winfo_y() + e.y - self._dy}")
 
-    def _poll(self):
-        changed = False
+    # --- animation loop ---------------------------------------------------
+    def _tick(self):
         while not _hud_queue.empty():
             try:
-                ns = _hud_queue.get_nowait()
-                if ns != self._state:
-                    self._state = ns
-                    changed = True
+                self._state = _hud_queue.get_nowait()
             except queue.Empty:
                 break
-        if changed:
-            self._apply()
-        self.root.after(60, self._poll)
 
-    def _apply(self):
-        cfg = HUD_CONFIG.get(self._state, HUD_CONFIG["standby"])
-        label_text, win_bg, frame_bg, fg = cfg
-        self.root.configure(bg=win_bg)
-        self.frame.configure(bg=frame_bg, highlightbackground=frame_bg)
-        self.label.configure(text=label_text, fg=fg, bg=frame_bg)
-        if self._pulse_job:
-            self.root.after_cancel(self._pulse_job)
-            self._pulse_job = None
-        if self._state in ("listening", "processing", "waking"):
-            self._pulse_bright = True
-            self._start_pulse(fg)
+        label, rgb, speed, amp, base = ORB_STATES.get(self._state, ORB_STATES["standby"])
+        self._phase += speed
+        glow = base + amp * (0.5 + 0.5 * math.sin(self._phase))   # 0..1 breathing
 
-    def _start_pulse(self, fg: str):
-        if self._state not in ("listening", "processing", "waking"):
-            return
-        self._pulse_bright = not self._pulse_bright
-        self.label.configure(fg=(fg if self._pulse_bright else self._dim_color(fg)))
-        self._pulse_job = self.root.after(380, lambda: self._start_pulse(fg))
+        self._draw(rgb, glow, label)
+        self.root.after(40, self._tick)
+
+    def _draw(self, rgb, glow, label):
+        c = self.canvas
+        c.delete("all")
+        cx, cy = self.SIZE / 2, self.SIZE / 2
+        core_r = self.SIZE * 0.16
+
+        # Soft halo: a few translucent-looking rings, dimmer the further out.
+        for i in range(5, 0, -1):
+            r = core_r + i * (self.SIZE * 0.055)
+            fade = glow * (i / 6.0) * 0.55
+            c.create_oval(cx - r, cy - r, cx + r, cy + r,
+                          outline="", fill=self._mix(rgb, fade))
+
+        # Bright core, sized slightly by the breath.
+        r = core_r * (0.85 + 0.3 * glow)
+        c.create_oval(cx - r, cy - r, cx + r, cy + r,
+                      outline="", fill=self._mix(rgb, min(1.0, glow + 0.25)))
+        # Hot centre highlight.
+        hr = r * 0.45
+        c.create_oval(cx - hr, cy - hr, cx + hr, cy + hr,
+                      outline="", fill=self._mix((255, 255, 255), min(1.0, glow)))
+
+        c.create_text(cx, self.SIZE + 8, text=label, fill=self._mix(rgb, 0.9),
+                      font=self._font)
 
     @staticmethod
-    def _dim_color(hex_color: str) -> str:
-        h = hex_color.lstrip("#")
-        if len(h) != 6:
-            return hex_color
-        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-        return "#{:02x}{:02x}{:02x}".format(r // 2, g // 2, b // 2)
+    def _mix(rgb, factor):
+        """Scale an (r,g,b) toward black by factor (0..1) over the dark ground."""
+        factor = max(0.0, min(1.0, factor))
+        r, g, b = (min(255, int(channel * factor)) for channel in rgb)
+        return f"#{r:02x}{g:02x}{b:02x}"
 
 
 # ---------------------------------------------------------------------------
