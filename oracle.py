@@ -62,6 +62,24 @@ OWNER_NAME    = os.environ.get("ORACLE_OWNER_NAME", "Your Name")
 OWNER_FIRST   = os.environ.get("ORACLE_OWNER_FIRST", "Sir")
 
 VOICE             = "en-GB-RyanNeural"
+
+# The LLM brain. Groq retires model names every few months, so instead of
+# hard-coding one, leave GROQ_MODEL blank in .env and Oracle asks your account
+# which models exist and picks the best one it can actually use. Set GROQ_MODEL
+# in .env if you want to force a specific one.
+GROQ_MODEL        = os.environ.get("GROQ_MODEL", "").strip()
+WHISPER_MODEL     = "whisper-large-v3-turbo"
+
+# Preferred chat models, best first. Whichever your account has, wins.
+_MODEL_PREFERENCE = [
+    "llama-3.3-70b-versatile",
+    "moonshotai/kimi-k2-instruct",
+    "openai/gpt-oss-120b",
+    "qwen/qwen3-32b",
+    "llama-3.1-8b-instant",
+    "gemma2-9b-it",
+]
+
 DOCS_DIR          = os.path.expanduser("~/Documents")
 MEMORY_FILE       = os.path.join(DOCS_DIR, "oracle_memory.json")
 TEMP_AUDIO_DIR    = os.path.join(DOCS_DIR, "oracle_tmp")
@@ -71,6 +89,10 @@ TTS_RATE          = "+6%"
 TTS_AFPLAY_SPEED  = "1.0"
 MAX_HISTORY_TURNS = 20
 AUTO_SLEEP_MINUTES = 10
+
+# Jarvis stays quiet unless spoken to. Flip this on if you want a spoken
+# rundown (date, reminders) the first time you wake it each morning.
+MORNING_BRIEFING  = os.environ.get("ORACLE_MORNING_BRIEFING", "").lower() in ("1", "true", "yes")
 MAX_FACTS_CHARS   = 1_200
 MAX_CONTEXT_CHARS = 28_000
 
@@ -93,6 +115,55 @@ WORKSPACE_CONFIG: dict = {
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 os.makedirs(TEMP_AUDIO_DIR, exist_ok=True)
+
+_resolved_model: Optional[str] = None
+
+
+def _is_model_error(exc: Exception) -> bool:
+    """True if an exception looks like Groq rejecting the model name."""
+    text = str(exc).lower()
+    return "model" in text and ("not found" in text or "does not exist"
+                                in text or "decommission" in text or "404" in text)
+
+
+def get_llm_model(force_refresh: bool = False) -> str:
+    """Return a chat model this account can actually use.
+
+    Honours GROQ_MODEL from .env if set. Otherwise asks Groq for the live list
+    of models and picks the best one from _MODEL_PREFERENCE, falling back to the
+    first text model available. The result is cached so we only ask once.
+    """
+    global _resolved_model
+    if GROQ_MODEL:
+        return GROQ_MODEL
+    if _resolved_model and not force_refresh:
+        return _resolved_model
+
+    try:
+        available = {m.id for m in groq_client.models.list().data}
+    except Exception as e:
+        print(f"[Model] Couldn't list models ({e}) — using {_MODEL_PREFERENCE[0]}.")
+        _resolved_model = _MODEL_PREFERENCE[0]
+        return _resolved_model
+
+    # First choice from our preference list that the account actually has.
+    for name in _MODEL_PREFERENCE:
+        if name in available:
+            _resolved_model = name
+            print(f"[Model] Using {name}.")
+            return name
+
+    # Nothing matched — take the first model that isn't audio/guard/embedding.
+    for mid in sorted(available):
+        low = mid.lower()
+        if any(bad in low for bad in ("whisper", "tts", "guard", "embed")):
+            continue
+        _resolved_model = mid
+        print(f"[Model] Falling back to {mid}.")
+        return mid
+
+    _resolved_model = _MODEL_PREFERENCE[0]
+    return _resolved_model
 
 
 # ---------------------------------------------------------------------------
@@ -1617,7 +1688,7 @@ SYSTEM_PROMPT = f"""You are Oracle, the personal AI assistant of {OWNER_NAME}.
 You were built to run locally on {OWNER_FIRST}'s Mac. You have a deep, loyal relationship with him — you know his name, remember your conversations, and treat every interaction as if it matters.
 
 Personality:
-Speak in smooth, confident, natural prose. Never use bullet points, numbered lists, markdown headers, or asterisks — you are spoken out loud. Sound like a highly intelligent person who happens to know everything: warm, precise, never corporate or stiff. Address {OWNER_FIRST} as "Sir" once per response, woven in naturally. Keep responses appropriately concise: one clean sentence for simple lookups, two to four for anything requiring real explanation, more only when depth is genuinely needed.
+Speak in smooth, confident, natural prose. Never use bullet points, numbered lists, markdown headers, or asterisks — you are spoken out loud. Sound like a highly intelligent person who happens to know everything: warm, precise, never corporate or stiff. Address {OWNER_FIRST} as "Sir" once per response, woven in naturally. Be brief — this is Jarvis, not a lecture. Default to a single clean sentence. Use two or three only when the question genuinely needs explaining, and more only when {OWNER_FIRST} asks you to go deeper. Never pad, never list, never trail off with offers of further help.
 
 Hard rules:
 - For simple factual questions: one clean answer, then stop. No follow-up offers. No "shall I...".
@@ -1714,9 +1785,10 @@ def execute_action_tags(text: str) -> str:
 # LLM streaming response
 # ---------------------------------------------------------------------------
 
-def get_llm_response(user_text: str) -> None:
+def get_llm_response(user_text: str, _retry: bool = False) -> None:
     global _interaction_count
-    _interaction_count += 1
+    if not _retry:
+        _interaction_count += 1
     stop_tts_flag.clear()
     set_hud("processing")
 
@@ -1727,7 +1799,7 @@ def get_llm_response(user_text: str) -> None:
 
     try:
         stream = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=get_llm_model(),
             messages=build_llm_messages(user_text),
             temperature=0.55,
             max_tokens=700,
@@ -1772,6 +1844,13 @@ def get_llm_response(user_text: str) -> None:
             speak(" ".join(sentence_buffer))
 
     except Exception as e:
+        # If Groq rejected the model name (decommissioned, or not on this
+        # account), re-detect a working one and try again — just once.
+        if not _retry and _is_model_error(e):
+            print(f"[LLM] Model rejected ({e}) — re-detecting and retrying.")
+            get_llm_model(force_refresh=True)
+            get_llm_response(user_text, _retry=True)
+            return
         print(f"[LLM error] {e}")
         set_hud("error")
         speak("I ran into a processing error, Sir. Please try again.")
@@ -2109,53 +2188,32 @@ _briefing_date_given: Optional[str] = None   # tracks last briefing date
 
 def _should_give_briefing() -> bool:
     global _briefing_date_given
+    if not MORNING_BRIEFING:
+        return False
     today = datetime.date.today().isoformat()
     if _briefing_date_given != today:
         hour = datetime.datetime.now().hour
-        if 5 <= hour < 13:   # only mornings
+        if 5 <= hour < 12:   # only actual mornings
             _briefing_date_given = today
             return True
     return False
 
 
-_MOTIVATIONAL: list[str] = [
-    "Focus on what matters. The rest can wait.",
-    "Every day is another chance to build something great.",
-    "Discipline beats motivation. Keep moving.",
-    "Small consistent steps. That's how empires are built.",
-    "Clarity of purpose is the rarest form of intelligence.",
-    "The work doesn't care how you feel. Do it anyway.",
-    "Make today the one you'll remember.",
-    "Execution is everything. Think less, build more.",
-    "Your future self is watching. Don't disappoint him.",
-    "Pressure makes diamonds. You know this, Sir.",
-]
-
-
 def deliver_morning_briefing() -> None:
-    """Speak a morning briefing — date, facts, and a motivational line."""
-    now  = datetime.datetime.now()
-    day  = now.strftime("%A, %B %-d")
-    hour = now.strftime("%-I %M %p")
+    """Speak a short factual briefing — date, priorities, pending reminders."""
+    now = datetime.datetime.now()
+    speak(f"Good morning, Sir. It's {now.strftime('%A, %B %-d')}, {now.strftime('%-I:%M %p')}.")
 
-    lines = [f"Good morning, Sir. It's {day}, {hour}."]
-
-    # Recall any facts that look like goals or priorities
+    # Surface a goal/priority fact if one is stored.
     facts = list_facts()
     goal_keys = [k for k in facts if any(w in k for w in ("goal", "priority", "project", "focus"))]
     if goal_keys:
         key = goal_keys[0]
-        lines.append(f"Just a reminder — your {key.replace('_',' ')} is {facts[key]}.")
+        speak(f"Your {key.replace('_', ' ')} is {facts[key]}.")
 
-    # Any active timers / reminders
     if _active_reminders:
         count = len(_active_reminders)
-        lines.append(f"You have {count} pending reminder{'s' if count != 1 else ''} set.")
-
-    lines.append(random.choice(_MOTIVATIONAL))
-
-    for line in lines:
-        speak(line)
+        speak(f"You have {count} pending reminder{'s' if count != 1 else ''}.")
 
 
 # ---------------------------------------------------------------------------
@@ -3995,7 +4053,7 @@ def ask_oracle(prompt: str) -> None:
     set_hud("processing")
     try:
         stream = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=get_llm_model(),
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user",   "content": prompt},
