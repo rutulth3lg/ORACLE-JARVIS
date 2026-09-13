@@ -229,21 +229,15 @@ class OracleHUD:
 
         root.overrideredirect(True)
         root.attributes("-topmost", True)
-        root.attributes("-alpha", 0.95)
-        root.configure(bg="#08080c")
-        try:
-            # On macOS this makes the black window background see-through, so
-            # only the orb itself shows. Harmless (ignored) elsewhere.
-            root.wm_attributes("-transparent", True)
-        except Exception:
-            pass
+        root.attributes("-alpha", 0.96)
+        root.configure(bg="#0a0a10")
 
         w, h = self.SIZE, self.SIZE + 22
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-        root.geometry(f"{w}x{h}+{sw - w - 24}+{sh - h - 64}")
+        root.geometry(f"{w}x{h}+{sw - w - 24}+{sh - h - 90}")
 
         self.canvas = tk.Canvas(root, width=w, height=h,
-                                bg="#08080c", highlightthickness=0, bd=0)
+                                bg="#0a0a10", highlightthickness=0, bd=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
 
         # Let the user drag the orb wherever they like.
@@ -254,6 +248,16 @@ class OracleHUD:
             self._font = tkfont.Font(family="SF Pro Display", size=9, weight="bold")
         except Exception:
             self._font = tkfont.Font(family="Helvetica", size=9, weight="bold")
+
+        # macOS won't reliably paint a borderless, always-on-top window until
+        # it's forced onto screen — without this the orb can stay invisible.
+        try:
+            root.update_idletasks()
+            root.deiconify()
+            root.lift()
+            root.attributes("-topmost", True)
+        except Exception:
+            pass
 
         self.root.after(40, self._tick)
 
@@ -353,7 +357,10 @@ def save_memory() -> None:
                 "facts":    dict(_named_facts),
                 "saved_at": datetime.datetime.now().isoformat(),
             }
-        tmp = MEMORY_FILE + ".tmp"
+        # Unique temp name per write — two saves firing at once used to share
+        # one ".tmp" and race, so whichever renamed second hit "No such file".
+        os.makedirs(os.path.dirname(MEMORY_FILE), exist_ok=True)
+        tmp = f"{MEMORY_FILE}.{uuid.uuid4().hex}.tmp"
         try:
             with open(tmp, "w") as f:
                 json.dump(payload, f, indent=2)
@@ -3165,7 +3172,11 @@ def oracle_worker() -> None:
         _last_activity_time = time.time()
         _interaction_count += 1
 
+        # Barge-in: kill anything still playing from the last exchange...
         force_stop_tts()
+        # ...then re-open the gate, or this turn's own replies get swallowed.
+        # (quick commands like "what time is it" never cleared it themselves.)
+        stop_tts_flag.clear()
         set_hud("waking")
         _maybe_deliver_briefing()
         speak_blocking(contextual_greeting())
