@@ -1,68 +1,70 @@
 # Oracle
 
-local voice assistant for macOS. say "Oracle" and it wakes up.
+Local voice assistant for macOS. Say "Oracle" and it wakes up.
 
-open source — PRs welcome if you want to add stuff.
+Threaded architecture, Groq LLM backend, persistent memory, media playback, and system automation — all running locally except the LLM calls.
+
+Open source — PRs welcome if you want to add stuff.
 
 ---
 
-## what it does
+## What It Does
 
-- plays music by searching youtube (yt-dlp, no browser needed)
-- opens apps, websites, youtube videos
-- answers questions with conversation memory that persists across sessions
-- sets timers and reminders with voice + macOS notification callbacks
-- controls volume, takes screenshots, locks screen
-- remembers things you tell it ("remember that my car is a Tesla")
-- floating HUD in the corner showing status (STANDBY / LISTENING / SPEAKING)
-- auto-sleeps after inactivity
+- Plays music by searching YouTube (yt-dlp, no browser needed)
+- Opens apps, websites, YouTube videos
+- Answers questions with conversation memory that persists across sessions
+- Sets timers and reminders with voice + macOS notification callbacks
+- Controls volume, takes screenshots, locks screen
+- Remembers things you tell it ("remember that my car is a Tesla")
+- Floating HUD in the corner showing status (STANDBY / LISTENING / SPEAKING)
+- Auto-sleeps after inactivity
 
-## setup
+## Setup
 
 ```bash
 pip install groq edge-tts SpeechRecognition pyaudio yt-dlp
 brew install portaudio ffmpeg
 ```
 
-grab a free groq key from [console.groq.com](https://console.groq.com).
+Grab a free Groq key from [console.groq.com](https://console.groq.com).
 
 ```bash
 git clone https://github.com/rutulth3lg/ORACLE-JARVIS.git
 cd ORACLE-JARVIS
 cp .env.example .env
-# fill in your GROQ_API_KEY, ORACLE_OWNER_NAME, ORACLE_OWNER_FIRST
+# Fill in your GROQ_API_KEY, ORACLE_OWNER_NAME, ORACLE_OWNER_FIRST
 python oracle.py
 ```
 
-### auto-start at login
+### Auto-start at login
 ```bash
 python oracle.py --install
 ```
 
-## usage
+## Usage
 
-say **"Oracle"** or **"Jarvis"**, wait for **"Sir?"**, then talk.
+Say **"Oracle"** or **"Jarvis"**, wait for **"Sir?"**, then talk.
 
-| say this | it does this |
+| Say this | It does this |
 |---|---|
-| "play blinding lights" | finds + plays audio via yt-dlp |
-| "play sidemen on youtube" | opens youtube search in browser |
-| "open vs code" | launches the app |
-| "what's the weather" | answers using conversation context |
-| "set a timer for 5 minutes" | timer with voice + notification callback |
-| "remember that my birthday is march 15" | stores it, recalls later |
-| "take a screenshot" | screenshots your screen |
-| "go to sleep" | manual sleep mode |
+| "Play Blinding Lights" | Finds + plays audio via yt-dlp |
+| "Play Sidemen on YouTube" | Opens YouTube search in browser |
+| "Open VS Code" | Launches the app |
+| "What's the weather" | Answers using conversation context |
+| "Set a timer for 5 minutes" | Timer with voice + notification callback |
+| "Remember that my birthday is March 15" | Stores it, recalls later |
+| "Take a screenshot" | Screenshots your screen |
+| "Go to sleep" | Manual sleep mode |
 
-## how it works
+## How It Works
 
-- **wake word** — continuously listens for "oracle"/"jarvis" using google speech recognition
-- **LLM** — groq API running llama-3.3-70b for fast responses
-- **TTS** — edge-tts for natural voice output
-- **music** — yt-dlp searches youtube, streams audio directly
-- **memory** — JSON-based persistent memory for facts + conversation history
-- **HUD** — tkinter overlay window, always on top, updates state in real time
+- **Wake word** — Continuously listens for "Oracle"/"Jarvis" using Google Speech Recognition
+- **LLM** — Groq API running LLaMA-3.3-70B for fast responses
+- **TTS** — Edge-TTS for natural voice output
+- **Music** — yt-dlp searches YouTube, streams audio directly
+- **Memory** — JSON-based persistent memory for facts + conversation history
+- **HUD** — Tkinter overlay window, always on top, updates state in real time
 
-## tech
+## Tech
 
-python · groq API · edge-tts · speechrecognition · yt-dlp · tkinter
+Python · Groq API · Edge-TTS · SpeechRecognition · yt-dlp · Tkinter
