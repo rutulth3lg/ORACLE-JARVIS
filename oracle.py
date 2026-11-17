@@ -69,6 +69,11 @@ OWNER_FIRST   = os.environ.get("ORACLE_OWNER_FIRST", "Sir")
 
 VOICE             = "en-GB-RyanNeural"
 
+# Microsoft's online voice (above) sometimes turns requests away. When it does,
+# Oracle speaks with this built-in Mac voice instead of going silent. Daniel is
+# the British one that ships with macOS; run `say -v '?'` to list the others.
+FALLBACK_VOICE    = os.environ.get("ORACLE_FALLBACK_VOICE", "Daniel").strip() or "Daniel"
+
 # The LLM brain. Groq retires model names every few months, so instead of
 # hard-coding one, leave GROQ_MODEL blank in .env and Oracle asks your account
 # which models exist and picks the best one it can actually use. Set GROQ_MODEL
@@ -657,13 +662,61 @@ def _run_tts_event_loop() -> None:
     _tts_event_loop.run_until_complete(_tts_pipeline())
 
 
-async def _generate_tts(text: str, filepath: str) -> bool:
-    try:
-        await edge_tts.Communicate(text, VOICE, rate=TTS_RATE, volume="+8%").save(filepath)
-        return True
-    except Exception as e:
-        print(f"[TTS generate] {e}")
-        return False
+# After the online voice fails, use the Mac voice until this time, then give
+# the online one another go. Saves a slow failed request on every sentence.
+_edge_retry_at  = 0.0
+_EDGE_COOLDOWN  = 300
+
+
+def _say_to_file(text: str, filepath: str) -> Optional[str]:
+    """Render text with the Mac's built-in `say` voice. Returns the file, or None."""
+    out = os.path.splitext(filepath)[0] + ".aiff"
+    # Text goes in on stdin so a sentence starting with "-" can't be read as
+    # an option. If the chosen voice isn't installed, use the system default.
+    for voice_args in (["-v", FALLBACK_VOICE], []):
+        try:
+            r = subprocess.run(["say", *voice_args, "-o", out],
+                               input=text, text=True, capture_output=True, timeout=30)
+        except Exception as e:
+            print(f"[TTS] Mac voice failed: {e}")
+            return None
+        if r.returncode == 0 and os.path.exists(out):
+            return out
+    print(f"[TTS] Mac voice failed: {r.stderr.strip()}")
+    return None
+
+
+async def _generate_tts(text: str, filepath: str) -> Optional[str]:
+    """Turn text into an audio file. Returns its path, or None if both voices fail."""
+    global _edge_retry_at
+    if time.time() >= _edge_retry_at:
+        try:
+            await edge_tts.Communicate(text, VOICE, rate=TTS_RATE, volume="+8%").save(filepath)
+            return filepath
+        except Exception as e:
+            if _edge_retry_at == 0:
+                print(f"[TTS] Microsoft's online voice failed ({str(e)[:80]}).\n"
+                      f"[TTS] Using the Mac's built-in voice ({FALLBACK_VOICE}) for now. "
+                      f"To get the online voice back, run: pip3 install -U edge-tts\n"
+                      f"[TTS] (A 403 can also mean the Mac's clock is wrong.)")
+            _edge_retry_at = time.time() + _EDGE_COOLDOWN
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
+    return await _tts_event_loop.run_in_executor(None, _say_to_file, text, filepath)
+
+
+def _release_speaking_if_idle(ready) -> None:
+    """Once nothing is queued or waiting to play, Oracle is no longer speaking.
+
+    Announcements from background threads (timers, weather, git) have nobody
+    else to clear this, and while it stays set the wake word is ignored.
+    """
+    if ready is None and _tts_queue.empty():
+        _is_speaking.clear()
+        if not _worker_busy.is_set():
+            set_hud("standby")
 
 
 async def _tts_pipeline() -> None:
@@ -686,10 +739,12 @@ async def _tts_pipeline() -> None:
                     except OSError:
                         pass
                     ready = None
+                _release_speaking_if_idle(ready)
                 continue
-            ok = await _generate_tts(text, filepath)
-            if not ok:
+            audio_path = await _generate_tts(text, filepath)
+            if not audio_path:
                 _tts_queue.task_done()
+                _release_speaking_if_idle(ready)
                 continue
             if ready is not None:
                 if not stop_tts_flag.is_set():
@@ -700,7 +755,7 @@ async def _tts_pipeline() -> None:
                     except OSError:
                         pass
                 _tts_queue.task_done()
-            ready = (text, filepath)
+            ready = (text, audio_path)
         else:
             if ready is not None:
                 if not stop_tts_flag.is_set():
@@ -712,13 +767,7 @@ async def _tts_pipeline() -> None:
                         pass
                 _tts_queue.task_done()
                 ready = None
-                # Nothing left to say. Announcements from background threads
-                # (timers, weather, git) have nobody else to clear this, and
-                # while it stays set the wake word is ignored.
-                if _tts_queue.empty():
-                    _is_speaking.clear()
-                    if not _worker_busy.is_set():
-                        set_hud("standby")
+                _release_speaking_if_idle(ready)
 
 
 def speak(text: str) -> None:
@@ -3165,12 +3214,11 @@ def run_diagnostics() -> None:
     except Exception:
         lines.append("yt-dlp is not installed or not on the PATH.")
 
-    # edge-tts reachability (just import check — actual TTS requires internet)
-    try:
-        import edge_tts as _et
-        lines.append("edge-tts library is available.")
-    except ImportError:
-        lines.append("edge-tts is not installed.")
+    # Which voice is in use right now
+    if time.time() < _edge_retry_at:
+        lines.append(f"The online voice is unavailable, so I'm using the Mac's {FALLBACK_VOICE} voice.")
+    else:
+        lines.append("The online voice is working.")
 
     # Memory file
     if os.path.exists(MEMORY_FILE):

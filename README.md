@@ -89,7 +89,7 @@ Screenshots and anything it reads to answer you are sent to Groq, same as your v
 - **LLM** — Groq API. Oracle picks the best model your account has (set `GROQ_MODEL` in `.env` to choose)
 - **Tools** — The model calls real functions (shell, AppleScript, files, web, screen) in a loop until it has an answer
 - **Vision** — A Groq vision model reads screenshots
-- **TTS** — Edge-TTS for natural voice output
+- **TTS** — Edge-TTS for natural voice output, with the built-in Mac voice as a backup if that service is down
 - **Music** — yt-dlp searches YouTube, streams audio directly
 - **Memory** — JSON-based persistent memory for facts + conversation history
 - **HUD** — Tkinter orb, always on top, updates state in real time
